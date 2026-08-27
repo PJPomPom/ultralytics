@@ -7,13 +7,11 @@ model_name: yolo26n-obb
 
 # Oriented Bounding Boxes [Object Detection](https://www.ultralytics.com/glossary/object-detection)
 
-<!-- obb task poster -->
+<img width="1024" src="https://cdn.ul.run/i/5358256c7e6abec4c69ca11be99143ba.avif" alt="Ultralytics YOLO oriented bounding box detection of boats in aerial imagery">
 
 Oriented object detection goes a step further than standard object detection by introducing an extra angle to locate objects more accurately in an image.
 
 The output of an oriented object detector is a set of rotated bounding boxes that precisely enclose the objects in the image, along with class labels and confidence scores for each box. Oriented bounding boxes are particularly useful when objects appear at various angles, such as in aerial imagery, where traditional axis-aligned bounding boxes may include unnecessary background.
-
-<!-- youtube video link for obb task -->
 
 !!! tip
 
@@ -32,9 +30,9 @@ The output of an oriented object detector is a set of rotated bounding boxes tha
 
 ## Visual Samples
 
-|                                               Ships Detection using OBB                                               |                                                Vehicle Detection using OBB                                                |
-| :-------------------------------------------------------------------------------------------------------------------: | :-----------------------------------------------------------------------------------------------------------------------: |
-| ![Ships Detection using OBB](https://cdn.jsdelivr.net/gh/ultralytics/assets@main/docs/ships-detection-using-obb.avif) | ![Vehicle Detection using OBB](https://cdn.jsdelivr.net/gh/ultralytics/assets@main/docs/vehicle-detection-using-obb.avif) |
+|                                Ships Detection using OBB                                 |                                Vehicle Detection using OBB                                 |
+| :--------------------------------------------------------------------------------------: | :----------------------------------------------------------------------------------------: |
+| ![Ships Detection using OBB](https://cdn.ul.run/i/c6591549a27062e19a12e83e6c139728.avif) | ![Vehicle Detection using OBB](https://cdn.ul.run/i/bdc446c744810812060cea58a16d9065.avif) |
 
 ## [Models](https://github.com/ultralytics/ultralytics/tree/main/ultralytics/cfg/models/26)
 

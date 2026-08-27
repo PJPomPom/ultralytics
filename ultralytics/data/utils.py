@@ -171,7 +171,7 @@ def check_file_speeds(
         LOGGER.warning(
             f"{prefix}Slow image access detected ({ping_msg}{speed_msg}{size_msg}). "
             f"Use local storage instead of remote/mounted storage for better performance. "
-            f"See https://docs.ultralytics.com/guides/model-training-tips/"
+            f"See https://docs.ultralytics.com/guides/model-training-tips"
         )
 
 
@@ -513,7 +513,14 @@ def find_dataset_yaml(path: Path) -> Path:
     return files[0]
 
 
-def convert_ndjson_to_yolo_if_needed(data: str | Path) -> str | Path:
+def get_split_fraction(fraction: float | list[float | int], split: str) -> float | int:
+    """Return the dataset ratio or count for a train or validation split."""
+    if isinstance(fraction, list) and split in {"train", "val"}:
+        return fraction[split == "val"]
+    return fraction if split == "train" else 1.0
+
+
+def convert_ndjson_to_yolo_if_needed(data: str | Path, fraction=1.0) -> str | Path:
     """Convert an NDJSON dataset or Platform dataset URI to YOLO format."""
     data = normalize_platform_uri(data)  # accept Platform web URLs (https://platform.ultralytics.com/.../datasets/...)
     data_str = str(data)
@@ -522,7 +529,7 @@ def convert_ndjson_to_yolo_if_needed(data: str | Path) -> str | Path:
 
         from ultralytics.data.converter import convert_ndjson_to_yolo
 
-        return asyncio.run(convert_ndjson_to_yolo(data))
+        return asyncio.run(convert_ndjson_to_yolo(data, fraction=fraction))
     return data
 
 
@@ -674,7 +681,7 @@ def check_cls_dataset(dataset: str | Path, split: str = "") -> dict[str, Any]:
         if data_dir.suffix != "":
             raise ValueError(
                 f'Classification datasets must be a directory (data="path/to/dir") not a file (data="{dataset}"), '
-                "See https://docs.ultralytics.com/datasets/classify/"
+                "See https://docs.ultralytics.com/datasets/classify"
             )
         LOGGER.info("")
         LOGGER.warning(f"Dataset not found, missing path {data_dir}, attempting download...")

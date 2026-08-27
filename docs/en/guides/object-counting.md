@@ -32,10 +32,10 @@ Object counting with [Ultralytics YOLO26](https://github.com/ultralytics/ultraly
 
 ## Real World Applications
 
-|                                                                        Logistics                                                                         |                                                                          Aquaculture                                                                          |
-| :------------------------------------------------------------------------------------------------------------------------------------------------------: | :-----------------------------------------------------------------------------------------------------------------------------------------------------------: |
-| ![Conveyor Belt Packets Counting Using Ultralytics YOLO26](https://cdn.jsdelivr.net/gh/ultralytics/assets@main/docs/conveyor-belt-packets-counting.avif) | ![Fish Counting in Sea using Ultralytics YOLO26](https://cdn.jsdelivr.net/gh/ultralytics/assets@main/docs/fish-counting-in-sea-using-ultralytics-yolov8.avif) |
-|                                                 Conveyor Belt Packets Counting Using Ultralytics YOLO26                                                  |                                                         Fish Counting in Sea using Ultralytics YOLO26                                                         |
+|                                                       Logistics                                                        |                                                 Aquaculture                                                  |
+| :--------------------------------------------------------------------------------------------------------------------: | :----------------------------------------------------------------------------------------------------------: |
+| ![Conveyor Belt Packets Counting Using Ultralytics YOLO26](https://cdn.ul.run/i/f63ae2faf83bb9dff2ef777c213b85f5.avif) | ![Fish Counting in Sea using Ultralytics YOLO26](https://cdn.ul.run/i/01c5af886b2295753d88a201fbda959a.avif) |
+|                                Conveyor Belt Packets Counting Using Ultralytics YOLO26                                 |                                Fish Counting in Sea using Ultralytics YOLO26                                 |
 
 ## Count Objects with YOLO26
 
@@ -222,9 +222,9 @@ In this example, `classes_to_count=[0, 2]` means it counts objects of class `0` 
 Ultralytics YOLO26 provides several advantages over other object detection models like Faster R-CNN, SSD, and previous YOLO versions:
 
 1. **Speed and Efficiency:** YOLO26 offers real-time processing capabilities, making it ideal for applications requiring high-speed inference, such as surveillance and [autonomous driving](https://www.ultralytics.com/blog/ai-in-self-driving-cars).
-2. **[Accuracy](https://www.ultralytics.com/glossary/accuracy):** It provides state-of-the-art accuracy for object detection and tracking tasks, reducing the number of false positives and improving overall system reliability.
+2. **[Accuracy](https://www.ultralytics.com/glossary/accuracy):** It provides state-of-the-art detection and tracking accuracy, reducing false positives and improving overall system reliability.
 3. **Ease of Integration:** YOLO26 offers seamless integration with various platforms and devices, including mobile and [edge devices](nvidia-jetson.md), which is crucial for modern AI applications.
-4. **Flexibility:** Supports various tasks like object detection, [segmentation](../tasks/segment.md), and tracking with configurable models to meet specific use-case requirements.
+4. **Flexibility:** Supports [detection](../tasks/detect.md) and [segmentation](../tasks/segment.md) tasks with [track mode](../modes/track.md) on top, and configurable models to meet specific use-case requirements.
 
 Check out Ultralytics [YOLO26 Documentation](../models/yolo26.md) for a deeper dive into its features and performance comparisons.
 

@@ -1,12 +1,15 @@
 ---
 comments: true
+license:
+    name: CC-BY-NC-SA-3.0
+    url: https://creativecommons.org/licenses/by-nc-sa/3.0/
 description: Explore the Virtual KITTI 2 depth dataset for monocular depth estimation, a photorealistic synthetic recreation of KITTI driving scenes with dense per-pixel ground truth used to train Ultralytics YOLO26-Depth models.
 keywords: Ultralytics, YOLO, depth estimation, Virtual KITTI 2, vKITTI2, synthetic driving dataset, dense depth, monocular depth, autonomous driving
 ---
 
 # Virtual KITTI 2 Depth Dataset
 
-[Virtual KITTI 2](https://europe.naverlabs.com/research/computer-vision/proxy-virtual-worlds-vkitti-2/) (vKITTI2) is a photorealistic synthetic recreation of the KITTI driving scenes. It clones 5 sequences from the original KITTI dataset and re-renders them under varied weather and lighting conditions, providing dense per-pixel ground truth.
+[Virtual KITTI 2](https://europe.naverlabs.com/proxy-virtual-worlds-vkitti-2/) (vKITTI2) is a photorealistic synthetic recreation of the KITTI driving scenes. It clones 5 sequences from the original KITTI dataset and re-renders them under varied weather and lighting conditions, providing dense per-pixel ground truth.
 
 As a synthetic outdoor-driving dataset, vKITTI2 offers a dense counterpart to the sparse real KITTI LiDAR returns, making it a useful source of clean outdoor driving geometry for training monocular [depth estimation](https://www.ultralytics.com/glossary/depth-estimation) models.
 

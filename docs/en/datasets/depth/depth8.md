@@ -1,5 +1,7 @@
 ---
 comments: true
+license:
+    name: None
 description: Explore the Ultralytics Depth8 dataset, a compact set of 8 indoor RGB-D images for testing monocular depth estimation models and training pipelines.
 keywords: Depth8, Ultralytics, dataset, depth estimation, monocular depth, YOLO26, training, validation, debugging, SUN RGB-D
 ---
@@ -8,7 +10,9 @@ keywords: Depth8, Ultralytics, dataset, depth estimation, monocular depth, YOLO2
 
 ## Introduction
 
-The [Ultralytics](https://www.ultralytics.com/) Depth8 dataset is a compact [monocular depth estimation](index.md) dataset with 8 images sampled from the [SUN RGB-D](sunrgbd.md) dataset: 4 for training and 4 for validation, drawn from its Kinect v1 and Kinect v2 captures (two per sensor in each split) for dense, artifact-free ground-truth depth maps. It is designed for rapid testing, debugging, and experimentation with [YOLO26](../../models/yolo26.md) depth estimation models and training pipelines — the 1.3 MB archive auto-downloads on first use, so `yolo depth train data=depth8.yaml` starts training within seconds.
+The [Ultralytics](https://www.ultralytics.com) Depth8 dataset is a compact [monocular depth estimation](index.md) dataset with 8 images sampled from the [SUN RGB-D](sunrgbd.md) dataset: 4 for training and 4 for validation, drawn from its Kinect v1 and Kinect v2 captures (two per sensor in each split) for dense, artifact-free ground-truth depth maps. It is designed for rapid testing, debugging, and experimentation with [YOLO26](../../models/yolo26.md) depth estimation models and training pipelines — the 1.3 MB archive auto-downloads on first use, so `yolo depth train data=depth8.yaml` starts training within seconds.
+
+Explore [Depth8 on Ultralytics Platform](https://platform.ultralytics.com/ultralytics/datasets/depth8) to preview its RGB-depth pairs and clone it for training.
 
 !!! note
 
@@ -67,7 +71,7 @@ To train a YOLO26n-depth model on the Depth8 dataset with an image size of 640, 
 
 ## Citations and Acknowledgments
 
-Depth8 is sampled from SUN RGB-D — see the full [SUN RGB-D dataset page](sunrgbd.md#citations-and-acknowledgments) for license details.
+Depth8 is sampled from SUN RGB-D — see the full [SUN RGB-D dataset page](sunrgbd.md#citations-and-acknowledgments) for source attribution and citation details. The source dataset does not specify a license.
 
 If you use the SUN RGB-D dataset in your research or development work, please cite the following paper:
 
