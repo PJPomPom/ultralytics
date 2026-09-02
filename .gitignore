@@ -213,4 +213,14 @@ fuzz-datasets/
 fuzz-models/
 
 # Debug
-debug/
+debug/images/predict/*
+debug/images/val/*
+debug/labels/val/*
+
+debug/output/*
+debug/temp/*
+
+
+
+
+

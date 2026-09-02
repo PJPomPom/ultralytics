@@ -1,0 +1,6 @@
+# 训练模型
+yolo train data=D:\Work\Code\PythonProject\gitee\ultralytics\ultralytics\cfg\datasets\comps_10.yaml model=yolo26n.pt epochs=400 imgsz=640 batch=32 device=0 workers=4 amp=True degrees=15
+
+
+# 推理图片
+yolo predict model=yolo26s.pt source=ultralytics/assets/bus.jpg
