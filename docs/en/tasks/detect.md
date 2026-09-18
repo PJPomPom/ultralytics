@@ -35,9 +35,11 @@ YOLO26 pretrained Detect models are shown here. Detect, Segment, and Pose models
 
 {% include "macros/yolo-det-perf.md" %}
 
-- **mAP<sup>val</sup>** values are for single-model single-scale on [COCO val2017](https://cocodataset.org/) dataset. <br>Reproduce by `yolo val detect data=coco.yaml device=0`
-- **Speed** averaged over COCO val images using an [Amazon EC2 P4d](https://aws.amazon.com/ec2/instance-types/p4/) instance. <br>Reproduce by `yolo val detect data=coco.yaml batch=1 device=0|cpu`
-- **Params** and **FLOPs** values are for the fused model after `model.fuse()`, which merges Conv and BatchNorm layers and, for end2end models, removes the auxiliary one-to-many detection head. Pretrained checkpoints retain the full training architecture and may show higher counts.
+- **mAP<sup>val</sup>** values are for single-model single-scale on [COCO val2017](https://cocodataset.org/) dataset. <br>Reproduce by `yolo val detect data=coco.yaml device=0`. Add `nms=False` to reproduce the e2e column.
+- **Speed** averaged over COCO val images using an [Amazon EC2 P4d](https://aws.amazon.com/ec2/instance-types/p4/) instance. <br>Reproduce by `yolo val detect data=coco.yaml batch=1 device=0|cpu nms=False`
+- **Params** and **FLOPs** values are for fused models after Conv/BatchNorm folding and removal of the unused detection branch. Pretrained checkpoints retain the full training architecture and may show higher counts.
+
+See the [unreleased YOLO27 preview](../models/yolo27.md#performance-metrics) for preliminary COCO detection results.
 
 ## Train
 
@@ -76,7 +78,7 @@ See full `train` mode details in the [Train](../modes/train.md) page. Detection 
 
 ### Dataset format
 
-YOLO detection dataset format can be found in detail in the [Dataset Guide](../datasets/detect/index.md). To convert your existing dataset from other formats (like COCO etc.) to YOLO format, please use [JSON2YOLO](https://github.com/ultralytics/JSON2YOLO) tool by Ultralytics. You can also annotate and manage detection datasets with [Ultralytics Platform's AI-assisted annotation tools](../platform/data/annotation.md).
+YOLO detection dataset format can be found in detail in the [Dataset Guide](../datasets/detect/index.md). To convert an existing COCO JSON dataset to YOLO format, use the built-in `convert_coco` function described in the [COCO to YOLO guide](../guides/coco-to-yolo.md). You can also annotate and manage detection datasets with [Ultralytics Platform's AI-assisted annotation tools](../platform/data/annotation.md).
 
 ## Val
 

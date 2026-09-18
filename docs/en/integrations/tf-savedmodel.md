@@ -87,14 +87,14 @@ The TF SavedModel format supports the [Export](../modes/export.md), [Predict](..
         model = YOLO("yolo26n.pt")
 
         # Export the model to TF SavedModel format
-        model.export(format="saved_model")  # creates '/yolo26n_saved_model'
+        model.export(format="saved_model")  # creates 'yolo26n_saved_model'
         ```
 
     === "CLI"
 
         ```bash
         # Export a YOLO26n PyTorch model to TF SavedModel format
-        yolo export model=yolo26n.pt format=saved_model # creates '/yolo26n_saved_model'
+        yolo export model=yolo26n.pt format=saved_model # creates 'yolo26n_saved_model'
         ```
 
 !!! example "Predict"
@@ -148,7 +148,7 @@ The TF SavedModel format supports the [Export](../modes/export.md), [Predict](..
 | `keras`    | `bool`                    | `False`         | Enables export to Keras format, providing compatibility with TensorFlow serving and APIs.                                                                                                                                                                        |
 | `quantize` | `int` or `str`            | `None`          | Quantization precision: `8` (INT8/PTQ; needs calibration `data`/`fraction`) or `32`/unset (FP32). FP16 is not supported for SavedModel export. Replaces the deprecated `int8` flag.                                                                              |
 | `opset`    | `int`                     | `None`          | Specifies the ONNX opset version for the intermediate ONNX graph. If not set, uses the latest supported version.                                                                                                                                                 |
-| `nms`      | `bool`                    | `False`         | Adds Non-Maximum Suppression (NMS), essential for accurate and efficient detection post-processing.                                                                                                                                                              |
+| `nms`      | `bool`, optional          | `None`          | Select raw output (`None`, default), embedded NMS (`True`), or the NMS-free head (`False`).                                                                                                                                                                      |
 | `batch`    | `int`                     | `1`             | Specifies export model batch inference size or the max number of images the exported model will process concurrently in `predict` mode.                                                                                                                          |
 | `data`     | `str`                     | `None`          | Path to the [dataset](../datasets/index.md) YAML, essential for quantization; classification instead takes a dataset directory or a built-in dataset name. If omitted with `quantize=8`, Ultralytics selects the default calibration dataset for the model task. |
 | `fraction` | `float`, `int`, or `list` | `1.0`           | Calibration subset as a ratio, image count, or `[train, val, test]` ratios/counts. Two-item lists leave `test` full, while `0` skips it.                                                                                                                         |
@@ -193,7 +193,7 @@ Exporting an Ultralytics YOLO model to the TensorFlow SavedModel format is strai
         model = YOLO("yolo26n.pt")
 
         # Export the model to TF SavedModel format
-        model.export(format="saved_model")  # creates '/yolo26n_saved_model'
+        model.export(format="saved_model")  # creates 'yolo26n_saved_model'
 
         # Load the exported TF SavedModel for inference
         tf_savedmodel_model = YOLO("./yolo26n_saved_model")
@@ -204,7 +204,7 @@ Exporting an Ultralytics YOLO model to the TensorFlow SavedModel format is strai
 
         ```bash
         # Export the YOLO26 model to TF SavedModel format
-        yolo export model=yolo26n.pt format=saved_model # creates '/yolo26n_saved_model'
+        yolo export model=yolo26n.pt format=saved_model # creates 'yolo26n_saved_model'
 
         # Run inference with the exported model
         yolo predict model='./yolo26n_saved_model' source='https://ultralytics.com/images/bus.jpg'

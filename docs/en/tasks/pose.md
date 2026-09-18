@@ -57,9 +57,11 @@ Ultralytics YOLO26 pretrained Pose models are shown here. Detect, Segment and Po
 
 {% include "macros/yolo-pose-perf.md" %}
 
-- **mAP<sup>val</sup>** values are for single-model single-scale on [COCO Keypoints val2017](https://cocodataset.org/) dataset. <br>Reproduce by `yolo val pose data=coco-pose.yaml device=0`
-- **Speed** averaged over COCO val images using an [Amazon EC2 P4d](https://aws.amazon.com/ec2/instance-types/p4/) instance. <br>Reproduce by `yolo val pose data=coco-pose.yaml batch=1 device=0|cpu`
-- **Params** and **FLOPs** values are for the fused model after `model.fuse()`, which merges Conv and BatchNorm layers and, for end2end models, removes the auxiliary one-to-many detection head. Pretrained checkpoints retain the full training architecture and may show higher counts.
+- **mAP<sup>val</sup>** values are for single-model single-scale on [COCO Keypoints val2017](https://cocodataset.org/) dataset. <br>Reproduce by `yolo val pose data=coco-pose.yaml device=0 nms=False`
+- **Speed** averaged over COCO val images using an [Amazon EC2 P4d](https://aws.amazon.com/ec2/instance-types/p4/) instance. <br>Reproduce by `yolo val pose data=coco-pose.yaml batch=1 device=0|cpu nms=False`
+- **Params** and **FLOPs** values are for fused models after Conv/BatchNorm folding and removal of the unused detection branch. Pretrained checkpoints retain the full training architecture and may show higher counts.
+
+See the [unreleased YOLO27 preview](../models/yolo27.md#performance-metrics) for preliminary COCO keypoint results.
 
 ## Train
 
@@ -98,7 +100,7 @@ See full `train` mode details in the [Train](../modes/train.md) page. Pose model
 
 ### Dataset format
 
-YOLO pose dataset format can be found in detail in the [Dataset Guide](../datasets/pose/index.md). To convert your existing dataset from other formats (like [COCO](../datasets/pose/coco.md) etc.) to YOLO format, please use the [JSON2YOLO](https://github.com/ultralytics/JSON2YOLO) tool by Ultralytics. [Ultralytics Platform annotation](../platform/data/annotation.md) also supports pose labels with built-in skeleton templates for person, hand, face, and custom keypoint layouts.
+YOLO pose dataset format can be found in detail in the [Dataset Guide](../datasets/pose/index.md). To convert an existing [COCO keypoints](../datasets/pose/coco.md) JSON dataset to YOLO format, use the built-in `convert_coco` function with `use_keypoints=True`, as described in the [COCO to YOLO guide](../guides/coco-to-yolo.md). [Ultralytics Platform annotation](../platform/data/annotation.md) also supports pose labels with built-in skeleton templates for person, hand, face, and custom keypoint layouts.
 
 For custom pose estimation tasks, you can also explore specialized datasets like [Tiger-Pose](../datasets/pose/tiger-pose.md) for animal pose estimation, [Hand Keypoints](../datasets/pose/hand-keypoints.md) for hand tracking, or [Dog-Pose](../datasets/pose/dog-pose.md) for canine pose analysis.
 

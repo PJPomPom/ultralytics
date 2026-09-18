@@ -22,7 +22,9 @@ OKS_SIGMA = (
     )
     / 10.0
 )
-RLE_WEIGHT = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.5, 1.5, 1.0, 1.0, 1.2, 1.2, 1.5, 1.5])
+RLE_WEIGHT = np.array(
+    [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.5, 1.5, 1.0, 1.0, 1.2, 1.2, 1.5, 1.5], dtype=np.float32
+)
 CITYSCAPES_WEIGHT = np.array(
     [
         0.8373,
@@ -163,7 +165,7 @@ def bbox_iou(
             if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
                 v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
                 with torch.no_grad():
-                    alpha = v / (v - iou + (1 + eps))
+                    alpha = v / (1 - iou + v + eps)
                 return iou - (rho2 / c2 + v * alpha)  # CIoU
             return iou - rho2 / c2  # DIoU
         c_area = cw * ch + eps  # convex area
@@ -1258,6 +1260,7 @@ class DetMetrics(SimpleClass, DataExportMixin):
                 "Instances": self.nt_per_class[self.ap_class_index[i]],
                 **{k: round(v[i], decimals) for k, v in per_class.items()},
                 "mAP50": round(self.class_result(i)[2], decimals),
+                "mAP75": round(self.box.all_ap[i, 5], decimals),
                 "mAP50-95": round(self.class_result(i)[3], decimals),
             }
             for i in range(len(per_class["Box-P"]))

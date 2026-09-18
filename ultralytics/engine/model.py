@@ -41,7 +41,7 @@ class Model(torch.nn.Module):
         predictor (BasePredictor): The predictor object used for making predictions.
         model (torch.nn.Module): The underlying PyTorch model.
         trainer (BaseTrainer): The trainer object used for training the model.
-        ckpt (dict): The checkpoint data if the model is loaded from a *.pt file.
+        ckpt (dict): The checkpoint data of the loaded weights, if any.
         cfg (str): The configuration of the model if loaded from a *.yaml file.
         ckpt_path (str): The path to the checkpoint file.
         overrides (dict): A dictionary of overrides for model configuration.
@@ -241,6 +241,7 @@ class Model(torch.nn.Module):
             >>> model._load("yolo26n.pt")
             >>> model._load("path/to/weights.pth", task="detect")
         """
+        model_uri = checks.normalize_platform_uri(weights)
         if weights.lower().startswith(checks.REMOTE_FILE_PREFIXES):
             weights = checks.check_file(weights, download_dir=SETTINGS["weights_dir"])  # download and return local file
         weights = checks.check_model_file_from_stem(weights)  # add suffix, i.e. yolo26n -> yolo26n.pt
@@ -255,7 +256,7 @@ class Model(torch.nn.Module):
             self.model, self.ckpt = weights, None
             self.task = task or guess_model_task(weights)
             self.ckpt_path = weights
-        self.overrides["model"] = weights
+        self.overrides["model"] = model_uri if str(model_uri).startswith("ul://") else weights
         self.overrides["task"] = self.task
         self.model_name = weights
 
@@ -309,16 +310,18 @@ class Model(torch.nn.Module):
                 m.reset_parameters()
         for p in self.model.parameters():
             p.requires_grad = True
+        self.overrides["pretrained"] = False  # train() builds the seeded model from the architecture
+        self.predictor = None
         return self
 
-    def load(self, weights: str | Path = "yolo26n.pt") -> Model:
+    def load(self, weights: str | Path | dict | torch.nn.Module = "yolo26n.pt") -> Model:
         """Load parameters from the specified weights file into the model.
 
         This method supports loading weights from a file or directly from a weights object. It matches parameters by
         name and shape and transfers them to the model.
 
         Args:
-            weights (str | Path): Path to the weights file or a weights object.
+            weights (str | Path | dict | torch.nn.Module): Path to the weights file, a checkpoint dict or a module.
 
         Returns:
             (Model): The instance of the class with loaded weights.
@@ -333,16 +336,22 @@ class Model(torch.nn.Module):
         """
         self._check_is_pytorch_model()
         if isinstance(weights, (str, Path)):
-            self.overrides["pretrained"] = weights  # remember the weights for DDP training
-            weights, self.ckpt = load_checkpoint(weights)
+            weights, ckpt = load_checkpoint(weights)
+            ckpt_path = weights.pt_path
+        else:
+            ckpt, ckpt_path = {"model": self.model}, None  # an object load has no file to resume from
+        self.overrides.pop("pretrained", None)
         self.model.load(weights)
+        self.ckpt, self.ckpt_path = ckpt, ckpt_path  # train() seeds from self.model while ckpt is set
+        self.predictor = None
         return self
 
     def save(self, filename: str | Path = "saved_model.pt") -> None:
         """Save the current model state to a file.
 
         This method exports the model's checkpoint (ckpt) to the specified filename. It includes metadata such as the
-        date, Ultralytics version, license information, and a link to the documentation.
+        date, Ultralytics version, license information, and a link to the documentation. The module is written as held
+        in memory: layers folded by ``fuse()`` stay folded, so training from the file transfers less.
 
         Args:
             filename (str | Path): The name of the file to save the model to.
@@ -359,12 +368,20 @@ class Model(torch.nn.Module):
         from datetime import datetime
 
         from ultralytics import __version__
+        from ultralytics.utils.torch_utils import qat_state, strip_qat
 
+        state = qat_state(self.model) if isinstance(self.model, torch.nn.Module) else None
+        model = (
+            deepcopy(self.model).half().to(memory_format=torch.contiguous_format)
+            if isinstance(self.model, torch.nn.Module)
+            else self.model
+        )
+        if isinstance(model, torch.nn.Module):
+            strip_qat(model)
         updates = {
             "ema": None,
-            "model": deepcopy(self.model).half().to(memory_format=torch.contiguous_format)
-            if isinstance(self.model, torch.nn.Module)
-            else self.model,
+            "model": model,
+            "modelopt": state,
             "date": datetime.now().astimezone().isoformat(),
             "version": __version__,
             "license": "AGPL-3.0 License (https://ultralytics.com/license)",
@@ -418,6 +435,7 @@ class Model(torch.nn.Module):
         self._check_is_pytorch_model()
         # DistillationModel fuses to its student, so adopt the return
         self.model = self.model.fuse(verbose=verbose, imgsz=imgsz)
+        self.predictor = None
         return self
 
     def embed(
@@ -508,6 +526,7 @@ class Model(torch.nn.Module):
         )
 
         custom = {"conf": 0.25, "batch": 1, "save": is_cli, "mode": "predict", "rect": True, "embed": None}
+        kwargs = _handle_deprecation(kwargs)
         prompts = kwargs.pop("prompts", None)  # for SAM-type models
         args = {**self.overrides, **custom, **kwargs}  # highest priority args on the right
 
@@ -515,6 +534,7 @@ class Model(torch.nn.Module):
             not self.predictor
             or self.predictor.args.device != args.get("device", self.predictor.args.device)
             or self.predictor.args.channels_last != args.get("channels_last", self.predictor.args.channels_last)
+            or self.predictor.args.nms != args.get("nms", self.predictor.args.nms)
             or self.predictor.args.quantize != QUANTIZE_ALIASES.get(str(q := args.get("quantize")).lower(), q)
         ):
             self.predictor = (predictor or self._smart_load("predictor"))(overrides=args, _callbacks=self.callbacks)
@@ -522,7 +542,7 @@ class Model(torch.nn.Module):
         else:  # only update args if predictor is already setup
             save_keys = ("project", "name", "save_dir", "exist_ok")
             prev_save_args = tuple(getattr(self.predictor.args, k, None) for k in save_keys)
-            setup_keys = ("device", "dnn", "data", "end2end", "compile", "channels_last", "quantize")
+            setup_keys = ("device", "dnn", "data", "nms", "compile", "channels_last", "quantize")
             base_args = {
                 **DEFAULT_CFG_DICT,
                 **self.overrides,
@@ -535,10 +555,6 @@ class Model(torch.nn.Module):
                 self.predictor.args.show = checks.check_imshow(warn=True)
             if prev_save_args != tuple(getattr(self.predictor.args, k, None) for k in save_keys):
                 self.predictor.save_dir = get_save_dir(self.predictor.args)
-            if getattr(self.model, "end2end", False):
-                self.model.set_head_attr(
-                    max_det=max(self.predictor.args.max_det, 300), agnostic_nms=self.predictor.args.agnostic_nms
-                )
         if prompts and hasattr(self.predictor, "set_prompts"):  # for SAM-type models
             self.predictor.set_prompts(prompts)
         return self.predictor.predict_cli(source=source) if is_cli else self.predictor(source=source, stream=stream)
@@ -580,7 +596,7 @@ class Model(torch.nn.Module):
         from ultralytics.trackers import register_tracker
 
         register_tracker(self, persist)
-        kwargs["conf"] = kwargs.get("conf") or 0.1  # trackers need low-confidence predictions as input
+        kwargs["conf"] = 0.1 if kwargs.get("conf") is None else kwargs["conf"]  # trackers need low-confidence input
         kwargs["batch"] = kwargs.get("batch") or 1  # batch-size 1 for tracking in videos
         kwargs["mode"] = "track"
         return self.predict(source=source, stream=stream, **kwargs)
@@ -655,7 +671,8 @@ class Model(torch.nn.Module):
         if data is not None:
             args["data"] = data
         validator = self._smart_load("validator")(args=args, _callbacks=self.callbacks)
-        validator(model=self.model)  # builds the dataloader and reports metrics with the current calibration
+        validator(model=self.model)
+        self.predictor = None  # calibration updates the retained model below
         res = fit_calibration_selective(
             self.model, validator.dataloader, validator.device, max_depth=validator.data.get("max_depth") or 100.0
         )
@@ -699,7 +716,7 @@ class Model(torch.nn.Module):
 
         from .exporter import export_formats
 
-        custom = {"verbose": False}  # method defaults
+        custom = {"verbose": False, "nms": None}  # method defaults
         kwargs = _handle_deprecation(kwargs)  # forward legacy flags (e.g. half/int8 -> quantize) before merging
         args = {**DEFAULT_CFG_DICT, **self.model.args, **custom, **kwargs, "mode": "benchmark"}
         fmts = export_formats()
@@ -707,6 +724,7 @@ class Model(torch.nn.Module):
             "batch",
             "data",
             "quantize",
+            "nms",
         }
         export_kwargs = {k: v for k, v in args.items() if k in export_args}  # quantize is passed explicitly below
         return benchmark(
@@ -717,6 +735,7 @@ class Model(torch.nn.Module):
             verbose=verbose,
             format=format,
             quantize=args.get("quantize"),
+            nms=args.get("nms"),
             **export_kwargs,
         )
 
@@ -736,7 +755,7 @@ class Model(torch.nn.Module):
                 - quantize (int | str): Precision, e.g. 16 (FP16) or 8 (INT8); 32/None is FP32.
                 - device (str): Device to run the export on.
                 - workspace (int): Maximum memory workspace size for TensorRT engines.
-                - nms (bool): Add Non-Maximum Suppression (NMS) module to model.
+                - nms (bool | None): None for raw output, True to embed NMS, or False for the NMS-free head where available.
                 - simplify (bool): Simplify ONNX model.
 
         Returns:
@@ -819,11 +838,14 @@ class Model(torch.nn.Module):
             # NOTE: handle the case when 'cfg' includes 'data'.
             "data": (overrides.get("data") if kwargs.get("cfg") else None)
             or DEFAULT_CFG_DICT["data"]
-            or TASK2DATA[self.task],
+            or (
+                None if isinstance(kwargs.get("resume", overrides.get("resume")), (str, Path)) else TASK2DATA[self.task]
+            ),
             "model": self.overrides["model"],
             "task": self.task,
         }  # method defaults
         args = {**overrides, **custom, **kwargs, "mode": "train"}  # prioritizes rightmost args
+        pretrained = args.setdefault("pretrained", self.overrides.get("pretrained", True))
         if isinstance(args.get("data"), (list, tuple)):  # fine-tune a single base model across multiple datasets
             from ultralytics.engine.trainer import MultiTrainer
 
@@ -836,10 +858,9 @@ class Model(torch.nn.Module):
             )
             self.metrics = self.trainer.train()
             return self.metrics
-        pretrained = kwargs.get("pretrained", overrides.get("pretrained", True) if kwargs.get("cfg") else True)
         if args.get("resume") is True:  # resume=True (boolean) uses current model as checkpoint
             if self.ckpt and self.ckpt.get("epoch", -1) >= 0 and self.ckpt.get("optimizer") is not None:
-                args["resume"] = self.ckpt_path
+                args["resume"], args["data"] = self.ckpt_path, kwargs.get("data") or overrides.get("data")
             else:
                 LOGGER.warning(
                     f"model '{self.ckpt_path}' is not a resumable training checkpoint "
@@ -923,14 +944,14 @@ class Model(torch.nn.Module):
 
             custom = {}  # method defaults
             args = {**self.overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
-            return Tuner(args=args, _callbacks=self.callbacks)(iterations=iterations)
+            return Tuner(args=args, model=self.model, _callbacks=self.callbacks)(iterations=iterations)
 
     def _apply(self, fn) -> Model:
         """Apply a function to model parameters, buffers, and tensors.
 
-        This method extends the functionality of the parent class's _apply method by additionally resetting the
-        predictor and updating the device in the model's overrides. It's typically used for operations like moving the
-        model to a different device or changing its precision.
+        This method extends the functionality of the parent class's _apply method by additionally updating the device
+        in the model's overrides and dropping the cached predictor when a model tensor is converted. No-op tensor
+        conversions preserve the predictor.
 
         Args:
             fn (Callable): A function to be applied to the model's tensors. This is typically a method like to(), cpu(),
@@ -947,8 +968,14 @@ class Model(torch.nn.Module):
             >>> model = model._apply(lambda t: t.cuda())  # Move model to GPU
         """
         self._check_is_pytorch_model()
-        super()._apply(fn)
-        self.predictor = None  # reset predictor as device may have changed
+
+        def apply(t):
+            converted = fn(t)
+            if converted is not t:
+                self.predictor = None  # predictor owns a copy, including buffers and detection-head tensors
+            return converted
+
+        super()._apply(apply)
         self.overrides["device"] = self.device  # was str(self.device) i.e. device(type='cuda', index=0) -> 'cuda:0'
         return self
 

@@ -11,13 +11,14 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.init import constant_, xavier_uniform_
 
+from ultralytics.utils import LOGGER
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
-from .utils import bias_init_with_prob, linear_init
+from .utils import bias_init_with_prob
 
 __all__ = (
     "OBB",
@@ -152,12 +153,16 @@ class Detect(nn.Module):
 
     @property
     def end2end(self):
-        """Checks if the model has one2one for v3/v5/v8/v9/v11 backward compatibility."""
-        return getattr(self, "_end2end", True) and hasattr(self, "one2one")
+        """Select one-to-one inference when requested or when fusion has removed the one-to-many head."""
+        return getattr(self, "one2one_cv2", None) is not None and (getattr(self, "_end2end", False) or self.cv2 is None)
 
     @end2end.setter
     def end2end(self, value):
-        """Override the end-to-end detection mode."""
+        """Select the inference head without changing dual-head training."""
+        if value and getattr(self, "one2one_cv2", None) is None:
+            LOGGER.warning("This model has no one-to-one head; using one-to-many outputs.")
+        elif not value and self.cv2 is None:
+            LOGGER.warning("The one-to-many head was removed by fusion; using the remaining one-to-one head.")
         self._end2end = value
 
     def forward_head(
@@ -176,13 +181,13 @@ class Detect(nn.Module):
     ) -> dict[str, torch.Tensor] | torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         preds = self.forward_head(x, **self.one2many)
-        if self.end2end:
+        if getattr(self, "one2one_cv2", None) is not None:
             x_detach = [xi.detach() for xi in x] if self.training else x  # detach keeps one2one out of the backbone
             one2one = self.forward_head(x_detach, **self.one2one)
             preds = {"one2many": preds, "one2one": one2one}
         if self.training:
             return preds
-        y = self._inference(preds["one2one"] if self.end2end else preds)
+        y = self._inference(preds["one2one" if self.end2end else "one2many"] if "one2one" in preds else preds)
         if self.end2end:
             y = self.postprocess(y.permute(0, 2, 1))
         return y if self.export else (y, preds)
@@ -207,7 +212,7 @@ class Detect(nn.Module):
             self.anchors, self.strides = (a.transpose(0, 1) for a in make_anchors(x["feats"], self.stride, 0.5))
             self.shape = shape
 
-        dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0)) * self.strides
+        dbox = self.decode_bboxes(self.dfl(x["boxes"]), self.anchors.unsqueeze(0), x.get("angle")) * self.strides
         return dbox
 
     def bias_init(self):
@@ -217,21 +222,18 @@ class Detect(nn.Module):
             b[-1].bias.data[: self.nc] = math.log(
                 5 / self.nc / (640 / self.stride[i]) ** 2
             )  # cls (.01 objects, 80 classes, 640 img)
-        if self.end2end:
+        if getattr(self, "one2one_cv2", None) is not None:
             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):  # from
                 a[-1].bias.data[:] = 2.0  # box
                 b[-1].bias.data[: self.nc] = math.log(
                     5 / self.nc / (640 / self.stride[i]) ** 2
                 )  # cls (.01 objects, 80 classes, 640 img)
 
-    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, xywh: bool = True) -> torch.Tensor:
-        """Decode bounding boxes from predictions."""
-        return dist2bbox(
-            bboxes,
-            anchors,
-            xywh=xywh and not self.end2end and not self.xyxy,
-            dim=1,
-        )
+    def decode_bboxes(
+        self, bboxes: torch.Tensor, anchors: torch.Tensor, angle: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Decode bounding boxes from predictions, angle is only used by the OBB head."""
+        return dist2bbox(bboxes, anchors, xywh=not self.end2end and not self.xyxy, dim=1)
 
     def postprocess(self, preds: torch.Tensor) -> torch.Tensor:
         """Post-processes YOLO model predictions.
@@ -273,8 +275,11 @@ class Detect(nn.Module):
         return scores[..., None], (index % nc)[..., None].float(), self._gather(ori_index, index // nc)
 
     def fuse(self) -> None:
-        """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = None
+        """Remove the unused detection branch for inference."""
+        end2end = self.end2end
+        for name in tuple(self._modules):
+            if name.startswith("one2one_"):
+                setattr(self, name[8:] if end2end else name, None)
 
 
 class Segment(Detect):
@@ -335,7 +340,7 @@ class Segment(Detect):
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x[0])  # mask protos
         if isinstance(preds, dict):  # training and validating during training
-            if self.end2end:
+            if "one2one" in preds:
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = proto.detach()
             else:
@@ -358,10 +363,6 @@ class Segment(Detect):
             bs = x[0].shape[0]  # batch size
             preds["mask_coefficient"] = torch.cat([mask_head[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], 2)
         return preds
-
-    def fuse(self) -> None:
-        """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = self.cv4 = None
 
 
 class Segment26(Segment):
@@ -405,7 +406,7 @@ class Segment26(Segment):
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x)  # mask protos
         if isinstance(preds, dict):  # training and validating during training
-            if self.end2end:
+            if "one2one" in preds:
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = (
                     tuple(p.detach() for p in proto) if isinstance(proto, tuple) else proto.detach()
@@ -417,7 +418,7 @@ class Segment26(Segment):
         return (outputs, proto) if self.export else ((outputs[0], proto), preds)
 
     def fuse(self) -> None:
-        """Remove the one2many head and extra part of proto module for inference optimization."""
+        """Remove the unused detection branch and training-only prototype layers for inference."""
         super().fuse()
         if hasattr(self.proto, "fuse"):
             self.proto.fuse()
@@ -431,7 +432,6 @@ class OBB(Detect):
     Attributes:
         ne (int): Number of extra parameters.
         cv4 (nn.ModuleList): Convolution layers for angle prediction.
-        angle (torch.Tensor): Predicted rotation angles.
 
     Methods:
         forward: Concatenate and return predicted bounding boxes and class probabilities.
@@ -474,8 +474,6 @@ class OBB(Detect):
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities, concatenated with rotation angles."""
-        # For decode_bboxes convenience
-        self.angle = x["angle"]
         preds = super()._inference(x)
         return torch.cat([preds, x["angle"]], dim=1)
 
@@ -493,13 +491,9 @@ class OBB(Detect):
             preds["angle"] = angle
         return preds
 
-    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+    def decode_bboxes(self, bboxes: torch.Tensor, anchors: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
         """Decode rotated bounding boxes."""
-        return dist2rbox(bboxes, self.angle, anchors, dim=1)
-
-    def fuse(self) -> None:
-        """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = self.cv4 = None
+        return dist2rbox(bboxes, angle, anchors, dim=1)
 
 
 class OBB26(OBB):
@@ -510,7 +504,6 @@ class OBB26(OBB):
     Attributes:
         ne (int): Number of extra parameters.
         cv4 (nn.ModuleList): Convolution layers for angle prediction.
-        angle (torch.Tensor): Predicted rotation angles.
 
     Methods:
         forward_head: Concatenate and return predicted bounding boxes, class probabilities, and raw angles.
@@ -600,10 +593,6 @@ class Pose(Detect):
             bs = x[0].shape[0]  # batch size
             preds["kpts"] = torch.cat([pose_head[i](x[i]).view(bs, self.nk, -1) for i in range(self.nl)], 2)
         return preds
-
-    def fuse(self) -> None:
-        """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = self.cv4 = None
 
     def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
         """Decode keypoints from predictions."""
@@ -714,9 +703,10 @@ class Pose26(Pose):
         return preds
 
     def fuse(self) -> None:
-        """Remove the one2many head for inference optimization."""
+        """Remove the unused detection branch and training-only layers for inference."""
         super().fuse()
-        self.cv4_kpts = self.cv4_sigma = self.flow_model = self.one2one_cv4_sigma = None
+        self.flow_model = None
+        setattr(self, "one2one_cv4_sigma" if self.end2end else "cv4_sigma", None)
 
     def kpts_decode(self, kpts: torch.Tensor) -> torch.Tensor:
         """Decode keypoints from predictions."""
@@ -1009,7 +999,7 @@ class LRPCHead(nn.Module):
             return (
                 loc_feat,
                 cls_feat.flatten(2),
-                torch.ones(cls_feat.shape[2] * cls_feat.shape[3], device=cls_feat.device, dtype=torch.bool),
+                cls_feat.new_ones(cls_feat.shape[2] * cls_feat.shape[3], dtype=torch.bool),
             )
 
 
@@ -1086,8 +1076,8 @@ class YOLOEDetect(Detect):
     @smart_inference_mode(False)  # fused layers stay in the model, so they must not be inference tensors
     def fuse(self, txt_feats: torch.Tensor = None):
         """Fuse text features with model weights for efficient inference."""
-        if txt_feats is None:  # means eliminate one2many branch
-            self.cv2 = self.cv3 = self.cv4 = None
+        if txt_feats is None:  # remove the unused detection branch
+            super().fuse()
             return
         if self.is_fused:
             return
@@ -1096,7 +1086,7 @@ class YOLOEDetect(Detect):
         txt_feats = txt_feats.to(next(self.parameters()).dtype).squeeze(0)
         if self.cv3 and self.cv4:
             self._fuse_tp(txt_feats, self.cv3, self.cv4)
-        if self.end2end:
+        if getattr(self, "one2one_cv2", None) is not None:
             self._fuse_tp(txt_feats, self.one2one_cv3, self.one2one_cv4)
         del self.reprta
         self.reprta = nn.Identity()
@@ -1162,9 +1152,8 @@ class YOLOEDetect(Detect):
         """Process features with fused text embeddings to generate detections for prompt-free model."""
         boxes, scores, index = [], [], []
         bs = x[0].shape[0]
-        # Prompt-free fusion removes the one-to-many heads.
-        cv2 = self.one2one_cv2 if self.end2end or self.cv2 is None else self.cv2
-        cv3 = self.one2one_cv3 if self.end2end or self.cv3 is None else self.cv3
+        cv2 = self.one2one_cv2 if self.end2end else self.cv2
+        cv3 = self.one2one_cv3 if self.end2end else self.cv3
         conf = 0 if self.export and not self.dynamic else getattr(self, "conf", 0.001)
         for i in range(self.nl):
             cls_feat = cv3[i](x[i])
@@ -1224,7 +1213,7 @@ class YOLOEDetect(Detect):
             a[-1].bias.data[:] = 2.0  # box
             b[-1].bias.data[:] = 0.0
             c.bias.data[:] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
-        if self.end2end:
+        if getattr(self, "one2one_cv2", None) is not None:
             for i, (a, b, c) in enumerate(
                 zip(self.one2one["box_head"], self.one2one["cls_head"], self.one2one["contrastive_head"])
             ):
@@ -1308,9 +1297,9 @@ class YOLOESegment(YOLOEDetect):
         """Process features with fused text embeddings to generate detections for prompt-free model."""
         boxes, scores, index = [], [], []
         bs = x[0].shape[0]
-        cv2 = self.one2one_cv2 if self.end2end or self.cv2 is None else self.cv2
-        cv3 = self.one2one_cv3 if self.end2end or self.cv3 is None else self.cv3
-        cv5 = self.one2one_cv5 if self.end2end or self.cv5 is None else self.cv5
+        cv2 = self.one2one_cv2 if self.end2end else self.cv2
+        cv3 = self.one2one_cv3 if self.end2end else self.cv3
+        cv5 = self.one2one_cv5 if self.end2end else self.cv5
         conf = 0 if self.export and not self.dynamic else getattr(self, "conf", 0.001)
         for i in range(self.nl):
             cls_feat = cv3[i](x[i])
@@ -1340,7 +1329,7 @@ class YOLOESegment(YOLOEDetect):
         preds = outputs[1] if isinstance(outputs, tuple) else outputs
         proto = self.proto(x[0])  # mask protos
         if isinstance(preds, dict):  # training and validating during training
-            if self.end2end:
+            if "one2one" in preds:
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = proto.detach()
             else:
@@ -1372,8 +1361,7 @@ class YOLOESegment(YOLOEDetect):
     def fuse(self, txt_feats: torch.Tensor = None):
         """Fuse text features with model weights for efficient inference."""
         super().fuse(txt_feats)
-        if txt_feats is None:  # means eliminate one2many branch
-            self.cv5 = None
+        if txt_feats is None:  # remove training-only prototype layers
             if hasattr(self.proto, "fuse"):
                 self.proto.fuse()
             return
@@ -1432,7 +1420,7 @@ class YOLOESegment26(YOLOESegment):
         proto = self.proto([xi.detach() for xi in x], return_semantic=False)  # mask protos
 
         if isinstance(preds, dict):  # training and validating during training
-            if self.end2end and not hasattr(self, "lrpc"):  # not prompt-free
+            if "one2one" in preds:  # dual-head outputs, not prompt-free
                 preds["one2many"]["proto"] = proto
                 preds["one2one"]["proto"] = proto.detach()
             else:
@@ -1589,7 +1577,7 @@ class RTDETRDecoder(nn.Module):
         dn_embed, dn_bbox, attn_mask, dn_meta = get_cdn_group(
             batch,
             self.nc,
-            self.num_queries,
+            min(self.num_queries, feats.shape[1]),
             self.denoising_class_embed.weight,
             self.num_denoising,
             self.label_noise_ratio,
@@ -1632,6 +1620,11 @@ class RTDETRDecoder(nn.Module):
                 export, and last dimension format [cx, cy, w, h, max_class_prob, class_index].
         """
         k = min(self.num_queries, self.max_det) if self.export else self.num_queries
+        k = (
+            (torch._shape_as_tensor(scores)[1] * self.nc).clamp(max=k)
+            if self.dynamic
+            else min(k, scores.shape[1] * self.nc)
+        )
         groups = 8 if self.export and self.format == "engine" and not self.dynamic else 1
         scores, index = Detect._grouped_topk(scores.flatten(1), k, groups)
         # CoreML MIL lacks integer floor-div and mod lowering: use torch.div(rounding_mode="floor") and (index - q*nc).
@@ -1642,18 +1635,16 @@ class RTDETRDecoder(nn.Module):
     @staticmethod
     def _generate_anchors(
         shapes: list[list[int]],
+        feats: torch.Tensor,
         grid_size: float = 0.05,
-        dtype: torch.dtype = torch.float32,
-        device: str = "cpu",
         eps: float = 1e-2,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Generate anchor bounding boxes for given shapes with specific grid size and validate them.
 
         Args:
             shapes (list): List of feature map shapes.
+            feats (torch.Tensor): Tensor whose dtype and device the anchors inherit.
             grid_size (float, optional): Base size of grid cells.
-            dtype (torch.dtype, optional): Data type for tensors.
-            device (str, optional): Device to create tensors on.
             eps (float, optional): Small value for numerical stability.
 
         Returns:
@@ -1662,14 +1653,11 @@ class RTDETRDecoder(nn.Module):
         """
         anchors = []
         for i, (h, w) in enumerate(shapes):
-            sy = torch.arange(end=h, dtype=dtype, device=device)
-            sx = torch.arange(end=w, dtype=dtype, device=device)
+            sy = torch.arange(h).type_as(feats)  # type_as inherits the runtime device in traces, unlike device=
+            sx = torch.arange(w).type_as(feats)
             grid_y, grid_x = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_11 else torch.meshgrid(sy, sx)
-            grid_xy = torch.stack([grid_x, grid_y], -1)  # (h, w, 2)
-
-            valid_WH = torch.tensor([w, h], dtype=dtype, device=device)
-            grid_xy = (grid_xy.unsqueeze(0) + 0.5) / valid_WH  # (1, h, w, 2)
-            wh = torch.ones_like(grid_xy, dtype=dtype, device=device) * grid_size * (2.0**i)
+            grid_xy = torch.stack([(grid_x + 0.5) / w, (grid_y + 0.5) / h], -1)[None]  # (1, h, w, 2)
+            wh = torch.full_like(grid_xy, grid_size * (2.0**i))
             anchors.append(torch.cat([grid_xy, wh], -1).view(-1, h * w, 4))  # (1, h*w, 4)
 
         anchors = torch.cat(anchors, 1)  # (1, h*w*nl, 4)
@@ -1727,7 +1715,7 @@ class RTDETRDecoder(nn.Module):
         """
         bs = feats.shape[0]
         if self.dynamic or self.shapes != shapes:
-            self.anchors, self.valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
+            self.anchors, self.valid_mask = self._generate_anchors(shapes, feats)
             self.shapes = shapes
 
         # Prepare input for decoder
@@ -1737,14 +1725,19 @@ class RTDETRDecoder(nn.Module):
         # Query selection
         # (bs*num_queries,)
         groups = 8 if self.export and self.format == "engine" and not self.dynamic else 1
-        topk_ind = Detect._grouped_topk(enc_outputs_scores.max(-1).values, self.num_queries, groups)[1].view(-1)
+        k = (
+            torch._shape_as_tensor(enc_outputs_scores)[1].clamp(max=self.num_queries)
+            if self.dynamic
+            else min(self.num_queries, enc_outputs_scores.shape[1])
+        )
+        topk_ind = Detect._grouped_topk(enc_outputs_scores.max(-1).values, k, groups)[1].view(-1)
         # (bs*num_queries,)
-        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, self.num_queries).view(-1)
+        batch_ind = torch.arange(end=bs, dtype=topk_ind.dtype).unsqueeze(-1).repeat(1, k).view(-1)
 
         # (bs, num_queries, 256)
-        top_k_features = features[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        top_k_features = features[batch_ind, topk_ind].view(bs, k, -1)
         # (bs, num_queries, 4)
-        top_k_anchors = self.anchors[:, topk_ind].view(bs, self.num_queries, -1)
+        top_k_anchors = self.anchors[:, topk_ind].view(bs, k, -1)
 
         # Dynamic anchors + static content
         refer_bbox = self.enc_bbox_head(top_k_features) + top_k_anchors
@@ -1752,9 +1745,11 @@ class RTDETRDecoder(nn.Module):
         enc_bboxes = refer_bbox.sigmoid()
         if dn_bbox is not None:
             refer_bbox = torch.cat([dn_bbox, refer_bbox], 1)
-        enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, self.num_queries, -1)
+        enc_scores = enc_outputs_scores[batch_ind, topk_ind].view(bs, k, -1)
 
-        embeddings = self.tgt_embed.weight.unsqueeze(0).repeat(bs, 1, 1) if self.learnt_init_query else top_k_features
+        embeddings = (
+            self.tgt_embed.weight[:k].unsqueeze(0).repeat(bs, 1, 1) if self.learnt_init_query else top_k_features
+        )
         if self.training:
             refer_bbox = refer_bbox.detach()
             if not self.learnt_init_query:
@@ -1768,18 +1763,14 @@ class RTDETRDecoder(nn.Module):
         """Initialize or reset the parameters of the model's various components with predefined weights and biases."""
         # Class and bbox head init
         bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
-        # NOTE: the weight initialization in `linear_init` would cause NaN when training with custom datasets.
-        # linear_init(self.enc_score_head)
         constant_(self.enc_score_head.bias, bias_cls)
         constant_(self.enc_bbox_head.layers[-1].weight, 0.0)
         constant_(self.enc_bbox_head.layers[-1].bias, 0.0)
         for cls_, reg_ in zip(self.dec_score_head, self.dec_bbox_head):
-            # linear_init(cls_)
             constant_(cls_.bias, bias_cls)
             constant_(reg_.layers[-1].weight, 0.0)
             constant_(reg_.layers[-1].bias, 0.0)
 
-        linear_init(self.enc_output[0])
         xavier_uniform_(self.enc_output[0].weight)
         if self.learnt_init_query:
             xavier_uniform_(self.tgt_embed.weight)
@@ -1805,7 +1796,7 @@ class v10Detect(Detect):
         __init__: Initialize the v10Detect object with specified number of classes and input channels.
         forward: Perform forward pass of the v10Detect module.
         bias_init: Initialize biases of the Detect module.
-        fuse: Remove the one2many head for inference optimization.
+        fuse: Remove the unused detection branch for inference.
 
     Examples:
         Create a v10Detect head
@@ -1813,8 +1804,6 @@ class v10Detect(Detect):
         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
         >>> outputs = v10_detect(x)
     """
-
-    end2end = True
 
     def __init__(self, nc: int = 80, ch: tuple = ()):
         """Initialize the v10Detect object with the specified number of classes and input channels.
@@ -1835,10 +1824,6 @@ class v10Detect(Detect):
             for x in ch
         )
         self.one2one_cv3 = copy.deepcopy(self.cv3)
-
-    def fuse(self):
-        """Remove the one2many head for inference optimization."""
-        self.cv2 = self.cv3 = None
 
 
 class SemanticSegment(nn.Module):

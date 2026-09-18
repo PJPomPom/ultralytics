@@ -3,35 +3,36 @@
 Check a model's accuracy on a test or val split of a dataset.
 
 Usage:
-    $ yolo mode=val model=yolo26n.pt data=coco8.yaml imgsz=640
+    $ yolo val model=yolo26n.pt data=coco8.yaml imgsz=640
 
 Usage - formats:
-    $ yolo mode=val model=yolo26n.pt                 # PyTorch
-                          yolo26n.torchscript        # TorchScript
-                          yolo26n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
-                          yolo26n_openvino_model     # OpenVINO
-                          yolo26n.engine             # TensorRT
-                          yolo26n.mlpackage          # CoreML (macOS-only)
-                          yolo26n_saved_model        # TensorFlow SavedModel
-                          yolo26n.pb                 # TensorFlow GraphDef
-                          yolo26n_edgetpu.tflite     # TensorFlow Edge TPU
-                          yolo26n_paddle_model       # PaddlePaddle
-                          yolo26n.mnn                # MNN
-                          yolo26n_ncnn_model         # NCNN
-                          yolo26n_imx_model          # Sony IMX
-                          yolo26n_rknn_model         # Rockchip RKNN
-                          yolo26n_executorch_model   # ExecuTorch
-                          yolo26n_axelera_model      # Axelera AI
-                          yolo26n_deepx_model        # DEEPX
-                          yolo26n_qnn.onnx           # Qualcomm QNN
-                          yolo26n.tflite             # LiteRT
-                          yolo26n_ascend_model       # Huawei Ascend
+    $ yolo val model=yolo26n.pt                 # PyTorch
+                     yolo26n.torchscript        # TorchScript
+                     yolo26n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
+                     yolo26n_openvino_model     # OpenVINO
+                     yolo26n.engine             # TensorRT
+                     yolo26n.mlpackage          # CoreML (macOS-only)
+                     yolo26n_saved_model        # TensorFlow SavedModel
+                     yolo26n.pb                 # TensorFlow GraphDef
+                     yolo26n_edgetpu.tflite     # TensorFlow Edge TPU
+                     yolo26n_paddle_model       # PaddlePaddle
+                     yolo26n.mnn                # MNN
+                     yolo26n_ncnn_model         # NCNN
+                     yolo26n_imx_model          # Sony IMX
+                     yolo26n_rknn_model         # Rockchip RKNN
+                     yolo26n_executorch_model   # ExecuTorch
+                     yolo26n_axelera_model      # Axelera AI
+                     yolo26n_deepx_model        # DEEPX
+                     yolo26n_qnn.onnx           # Qualcomm QNN
+                     yolo26n.tflite             # LiteRT
+                     yolo26n_ascend_model       # Huawei Ascend
 """
 
 from __future__ import annotations
 
 import json
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -143,26 +144,27 @@ class BaseValidator:
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
 
     @smart_inference_mode()
-    def __call__(self, trainer=None, model=None):
+    def __call__(self, trainer=None, model=None, **kwargs):
         """Execute validation process, running inference on dataloader and computing performance metrics.
 
         Args:
             trainer (object, optional): Trainer object that contains the model to validate.
             model (nn.Module, optional): Model to validate if not using a trainer.
+            **kwargs (Any): Task-specific model preparation arguments.
 
         Returns:
             (dict): Dictionary containing validation statistics.
         """
         self.training = trainer is not None
+        model = self.get_model(model, trainer, **kwargs)
         augment = self.args.augment and (not self.training)
         if self.training:
+            if hasattr(model, "end2end"):
+                model.end2end = self.args.nms is False
             self.device = trainer.device
             self.data = trainer.data
             # Keep training validation read-only: inputs may be fp16, but EMA/model weights stay fp32 under autocast.
             self.args.quantize = 16 if (self.device.type != "cpu" and trainer.amp) else None
-            model = trainer.ema.ema or trainer.model
-            if trainer.args.compile and hasattr(model, "_orig_mod"):
-                model = model._orig_mod  # validate non-compiled original model to avoid issues
             model = model.float()
             self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
@@ -171,11 +173,6 @@ class BaseValidator:
             if str(self.args.model).endswith(".yaml") and model is None:
                 LOGGER.warning("validating an untrained model YAML will result in 0 mAP.")
             callbacks.add_integration_callbacks(self)
-            if hasattr(model, "end2end"):
-                if self.args.end2end is not None:
-                    model.end2end = self.args.end2end
-                if model.end2end:
-                    model.set_head_attr(max_det=self.args.max_det, agnostic_nms=self.args.agnostic_nms)
             with torch_distributed_zero_first(LOCAL_RANK):
                 self.args.data = convert_ndjson_to_yolo_if_needed(self.args.data, self.args.fraction)
             device_type = str(self.args.device).split(":", 1)[0]
@@ -190,6 +187,7 @@ class BaseValidator:
                 data=self.args.data,
                 fp16=self.args.quantize == 16,
                 channels_last=self.args.channels_last,
+                end2end=self.args.nms is False,
             )
             self.device = model.device  # update device
             self.args.quantize = 16 if model.fp16 else None  # record actual inference precision
@@ -224,6 +222,7 @@ class BaseValidator:
             if not (pt or (getattr(model, "dynamic", False) and fmt != "imx")):
                 self.args.rect = False
             self.stride = model.stride  # used in get_dataloader() for padding
+            self.names = model.names  # used in get_dataloader() to filter classification samples
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
             model.eval()
@@ -345,6 +344,19 @@ class BaseValidator:
                         matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
                     correct[matches[:, 1].astype(int), i] = True
         return torch.from_numpy(correct)
+
+    @smart_inference_mode(False)
+    def get_model(self, model, trainer=None):
+        """Return the training EMA or an independent model for standalone validation.
+
+        Args:
+            model (torch.nn.Module | str | Path | None): Model or checkpoint for standalone validation.
+            trainer (object, optional): Trainer whose EMA is used during training validation.
+
+        Returns:
+            (torch.nn.Module | str | Path | None): Model to prepare for inference.
+        """
+        return trainer.ema.ema if trainer is not None else deepcopy(model)
 
     def add_callback(self, event: str, callback):
         """Append the given callback to the specified event."""

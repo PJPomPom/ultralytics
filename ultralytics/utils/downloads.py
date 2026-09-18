@@ -22,6 +22,8 @@ GITHUB_ASSETS_NAMES = frozenset(
     + [f"yolo12{k}{suffix}.pt" for k in "nsmlx" for suffix in ("",)]  # detect models only currently
     + [f"yolo26{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-sem", "-pose", "-obb", "-depth")]
     + [f"yolo26{k}-objv1{suffix}.pt" for k in "nsmlx" for suffix in ("-150", "-seg")]
+    + [f"yolo26{k}-{suffix}.pt" for k in "nsmlx" for suffix in ("distill", "sem-ade20k")]
+    + [f"yolo26{k}-reid.onnx" for k in "nsmlx"]
     + [f"yolov5{k}{resolution}u.pt" for k in "nsmlx" for resolution in ("", "6")]
     + [f"yolov3{k}u.pt" for k in ("", "-spp", "-tiny")]
     + [f"yolov8{k}-world.pt" for k in "smlx"]
@@ -30,6 +32,7 @@ GITHUB_ASSETS_NAMES = frozenset(
     + [f"yoloe-11{k}{suffix}.pt" for k in "sml" for suffix in ("-seg", "-seg-pf")]
     + [f"yoloe-26{k}{suffix}.pt" for k in "nsmlx" for suffix in ("-seg", "-seg-pf")]
     + [f"yolov9{k}.pt" for k in "tsmce"]
+    + [f"yolov9{k}-seg.pt" for k in "ce"]
     + [f"yolov10{k}.pt" for k in "nsmblx"]
     + [f"yolo_nas_{k}.pt" for k in "sml"]
     + [f"sam_{k}.pt" for k in "bl"]
@@ -40,7 +43,9 @@ GITHUB_ASSETS_NAMES = frozenset(
     + [
         "mobile_sam.pt",
         "mobileclip_blt.ts",
+        "mobileclip2_b.ts",
         "yolo11n-grayscale.pt",
+        "yolov8x-pose-p6.pt",
         "calibration_image_sample_data_20x128x128x3_float32.npy.zip",
     ]
 )
@@ -358,8 +363,9 @@ def safe_download(
                         # Stall bounds (not a total-transfer cap): abort if <1 B/s for 300 s so a dead connection
                         # cannot block interpreter shutdown while a non-daemon plot thread waits on a font download
                         args = ["--connect-timeout", "30", "--speed-limit", "1", "--speed-time", "300"]
+                        # -f is required: without it curl writes the server error page as the file and exits 0
                         r = subprocess.run(
-                            ["curl", "-#", f"-{s}L", url, "-o", f, "--retry", "3", "-C", "-", *args], check=False
+                            ["curl", "-#", f"-{s}fL", url, "-o", f, "--retry", "3", "-C", "-", *args], check=False
                         ).returncode
                         assert r == 0, f"Curl return value {r}"
                     else:  # requests download; timeout bounds connect and per-chunk read gaps, not total transfer

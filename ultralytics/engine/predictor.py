@@ -3,38 +3,38 @@
 Run prediction on images, videos, directories, globs, YouTube, webcam, streams, etc.
 
 Usage - sources:
-    $ yolo mode=predict model=yolo26n.pt source=0                               # webcam
-                                                img.jpg                         # image
-                                                vid.mp4                         # video
-                                                screen                          # screenshot
-                                                path/                           # directory
-                                                list.txt                        # list of images
-                                                list.streams                    # list of streams
-                                                'path/*.jpg'                    # glob
-                                                'https://youtu.be/LNwODJXcvt4'  # YouTube
-                                                'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP, TCP stream
+    $ yolo predict model=yolo26n.pt source=0                               # webcam
+                                           img.jpg                         # image
+                                           vid.mp4                         # video
+                                           screen                          # screenshot
+                                           path/                           # directory
+                                           list.txt                        # list of images
+                                           list.streams                    # list of streams
+                                           'path/*.jpg'                    # glob
+                                           'https://youtu.be/LNwODJXcvt4'  # YouTube
+                                           'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP, TCP stream
 
 Usage - formats:
-    $ yolo mode=predict model=yolo26n.pt                 # PyTorch
-                              yolo26n.torchscript        # TorchScript
-                              yolo26n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
-                              yolo26n_openvino_model     # OpenVINO
-                              yolo26n.engine             # TensorRT
-                              yolo26n.mlpackage          # CoreML (macOS-only)
-                              yolo26n_saved_model        # TensorFlow SavedModel
-                              yolo26n.pb                 # TensorFlow GraphDef
-                              yolo26n_edgetpu.tflite     # TensorFlow Edge TPU
-                              yolo26n_paddle_model       # PaddlePaddle
-                              yolo26n.mnn                # MNN
-                              yolo26n_ncnn_model         # NCNN
-                              yolo26n_imx_model          # Sony IMX
-                              yolo26n_rknn_model         # Rockchip RKNN
-                              yolo26n_executorch_model   # PyTorch ExecuTorch
-                              yolo26n_axelera_model      # Axelera AI
-                              yolo26n_deepx_model        # DEEPX
-                              yolo26n_qnn.onnx           # Qualcomm QNN
-                              yolo26n.tflite             # LiteRT
-                              yolo26n_ascend_model       # Huawei Ascend
+    $ yolo predict model=yolo26n.pt                 # PyTorch
+                         yolo26n.torchscript        # TorchScript
+                         yolo26n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
+                         yolo26n_openvino_model     # OpenVINO
+                         yolo26n.engine             # TensorRT
+                         yolo26n.mlpackage          # CoreML (macOS-only)
+                         yolo26n_saved_model        # TensorFlow SavedModel
+                         yolo26n.pb                 # TensorFlow GraphDef
+                         yolo26n_edgetpu.tflite     # TensorFlow Edge TPU
+                         yolo26n_paddle_model       # PaddlePaddle
+                         yolo26n.mnn                # MNN
+                         yolo26n_ncnn_model         # NCNN
+                         yolo26n_imx_model          # Sony IMX
+                         yolo26n_rknn_model         # Rockchip RKNN
+                         yolo26n_executorch_model   # PyTorch ExecuTorch
+                         yolo26n_axelera_model      # Axelera AI
+                         yolo26n_deepx_model        # DEEPX
+                         yolo26n_qnn.onnx           # Qualcomm QNN
+                         yolo26n.tflite             # LiteRT
+                         yolo26n_ascend_model       # Huawei Ascend
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ from __future__ import annotations
 import platform
 import re
 import threading
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -169,7 +170,9 @@ class BasePredictor:
             (torch.Tensor): Preprocessed image tensor of shape (N, 3, H, W).
         """
         if not isinstance(im, torch.Tensor):
-            im = torch.from_numpy(np.stack(self.pre_transform(im)))
+            im = self.pre_transform(im)
+            # For a single image, add a batch dimension without the copy required by np.stack().
+            im = torch.from_numpy(im[0]).unsqueeze(0) if len(im) == 1 else torch.from_numpy(np.stack(im))
             im = im.to(self.device)  # transfer as uint8, then reorder on device
             im = im.permute(0, 3, 1, 2)  # BHWC to BCHW, (n, 3, h, w)
             if im.shape[1] == 3:
@@ -316,6 +319,9 @@ class BasePredictor:
             self.args.augment, self.args.embed, self.args.visualize = False, None, False
 
         with self._lock:  # for thread-safe inference
+            if self.model.format == "pt" and self.model.end2end:
+                # Class filtering needs candidates before max_det truncation.
+                self.model.model.set_head_attr(max_det=max(self.args.max_det, 300), agnostic_nms=self.args.agnostic_nms)
             # Setup source every time predict is called
             self.setup_source(source if source is not None else self.args.source)
 
@@ -411,6 +417,7 @@ class BasePredictor:
             LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}{s}")
         self.run_callbacks("on_predict_end")
 
+    @smart_inference_mode(False)
     def setup_model(self, model, verbose: bool = True):
         """Initialize YOLO model with given parameters and set it to evaluation mode.
 
@@ -418,12 +425,7 @@ class BasePredictor:
             model (str | Path | torch.nn.Module): Model to load or use.
             verbose (bool): Whether to print verbose output.
         """
-        if hasattr(model, "end2end"):
-            if self.args.end2end is not None:
-                model.end2end = self.args.end2end
-            if model.end2end:
-                # Keep head top-k >= 300 so `classes` filtering in NMS sees all candidates before `max_det` truncation
-                model.set_head_attr(max_det=max(self.args.max_det, 300), agnostic_nms=self.args.agnostic_nms)
+        model = deepcopy(model)
         self.model = AutoBackend(
             model=model or self.args.model,
             device=select_device(self.args.device, verbose=verbose),
@@ -433,6 +435,7 @@ class BasePredictor:
             channels_last=self.args.channels_last,
             fuse=True,
             verbose=verbose,
+            end2end=self.args.nms is False,
         )
 
         self.device = self.model.device  # update device

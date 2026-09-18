@@ -98,6 +98,12 @@ class YOLODataset(BaseDataset):
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
         self.data = data
+        nkpt, ndim = self.data.get("kpt_shape", (0, 0))
+        if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):  # checked before the label cache is consulted
+            raise ValueError(
+                "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
+                "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
+            )
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
@@ -157,12 +163,13 @@ class YOLODataset(BaseDataset):
         return self.label_files
 
     def get_cache_hash(self) -> str:
-        """Return the hash used to validate a label cache against the current dataset files.
+        """Return the hash used to validate a label cache against the current dataset files and scan settings.
 
         Returns:
             (str): Dataset cache hash.
         """
-        return get_hash(self.label_files + self.im_files)
+        scan_args = (self.use_keypoints, len(self.data["names"]), self.data.get("kpt_shape"), self.single_cls)
+        return get_hash(self.label_files + self.im_files + [str(scan_args)])
 
     def scan_summary(self, nf: int, nm: int, ne: int, nc: int) -> str:
         """Return a one-line summary of scan counters for progress bars and cache logs.
@@ -185,11 +192,6 @@ class YOLODataset(BaseDataset):
             (tuple): (verify function, zipped argument iterable) for ThreadPool.imap.
         """
         nkpt, ndim = self.data.get("kpt_shape", (0, 0))
-        if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
-            raise ValueError(
-                "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
-                "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
-            )
         return verify_image_label, zip(
             self.im_files,
             self.label_files,
@@ -888,6 +890,7 @@ class SemanticDataset(YOLODataset):
         data (dict): Dataset configuration from YAML.
         mask_files (list[str]): List of mask file paths corresponding to images.
         include_class (np.ndarray | None): Class ids to keep per pixel (None keeps all).
+        masks (dict[int, np.ndarray]): Resized masks of the images in the mosaic buffer, evicted with them.
     """
 
     format_class = SemanticFormat
@@ -905,6 +908,7 @@ class SemanticDataset(YOLODataset):
         self.label_lut, self.inverse_lut = self._build_label_luts()
         self.mask_files = []
         self.include_class = None
+        self.masks = {}  # masks of the buffered images, evicted with the image buffer
         super().__init__(*args, data=data, **kwargs)
 
     def update_labels(self, include_class: list[int] | None) -> None:
@@ -1053,8 +1057,7 @@ class SemanticDataset(YOLODataset):
     def get_image_and_label(self, index):
         """Get image, label and semantic mask for the given index.
 
-        Overrides parent to include semantic mask so that Mosaic/CopyPaste mix images
-        also have their masks loaded.
+        Overrides parent to include the semantic mask, served from RAM for the images Mosaic draws from the buffer.
 
         Args:
             index (int): Dataset index.
@@ -1064,12 +1067,17 @@ class SemanticDataset(YOLODataset):
         """
         label = super().get_image_and_label(index)
         h, w = label["img"].shape[:2]
-        mask = self.load_mask(index, image_shape=(h, w))
-        if self.include_class is not None:  # keep only selected classes; remap the rest to the ignore label
-            mask[~np.isin(mask, self.include_class)] = 255
-        # Resize mask to match the resized image dimensions
-        if mask.shape[:2] != (h, w):
-            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        mask = self.masks.get(index)
+        if mask is None:
+            mask = self.load_mask(index, image_shape=(h, w))
+            if self.include_class is not None:  # keep only selected classes; remap the rest to the ignore label
+                mask[~np.isin(mask, self.include_class)] = 255
+            if mask.shape[:2] != (h, w):
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            if index in self.buffer:  # image is RAM-resident for mosaic reuse, keep its mask with it
+                self.masks[index] = mask
+                if len(self.masks) > len(self.buffer):
+                    self.masks = {i: self.masks[i] for i in self.buffer if i in self.masks}
         label["semantic_mask"] = mask
         return label
 
@@ -1153,7 +1161,7 @@ class ClassificationDataset:
         cache_images: Decode images into one contiguous RAM cache.
     """
 
-    def __init__(self, root: str, args, augment: bool = False, prefix: str = ""):
+    def __init__(self, root: str, args, augment: bool = False, prefix: str = "", names: dict[int, str] | None = None):
         """Initialize YOLO classification dataset with root directory, arguments, augmentations, and cache settings.
 
         Args:
@@ -1162,6 +1170,8 @@ class ClassificationDataset:
                 parameters, and cache settings.
             augment (bool, optional): Whether to apply augmentations to the dataset.
             prefix (str, optional): Prefix for logging and cache filenames, aiding in dataset identification.
+            names (dict[int, str], optional): Model class names; class folders are aligned to this order by name and
+                folders the model lacks are dropped, since each split's ImageFolder scan is indexed on its own.
         """
         import torchvision  # scope for faster 'import ultralytics'
 
@@ -1176,7 +1186,7 @@ class ClassificationDataset:
 
         # Initialize attributes
         fraction = 1.0 if is_ndjson else get_split_fraction(args.fraction, prefix or ("train" if augment else "val"))
-        count = fraction if isinstance(fraction, int) else round(len(self.samples) * fraction)
+        count = fraction if isinstance(fraction, int) else max(int(fraction > 0), round(len(self.samples) * fraction))
         self.samples = (
             [self.samples[i] for i in np.linspace(0, len(self.samples) - 1, count, dtype=int)]
             if count < len(self.samples)
@@ -1186,10 +1196,22 @@ class ClassificationDataset:
         self.cache_ram = args.cache is True or str(args.cache).lower() == "ram"  # cache images into RAM
         self.cache_disk = str(args.cache).lower() == "disk"  # cache images on hard drive as uncompressed *.npy files
         self.samples = self.verify_images()  # filter out bad images
-        if is_ndjson:
-            self.samples = [(f, int(Path(f).parent.name)) for f, _ in self.samples]
+        classes = self.base.classes  # this split's class folders, sorted, indexed by the ImageFolder target
         if args.single_cls:
-            self.samples = [(f, 0) for f, _ in self.samples]
+            index = dict.fromkeys(classes, 0)
+        elif is_ndjson:  # folders are the class ids
+            index = {c: int(c) for c in classes}
+        elif names and not set(classes).isdisjoint(names.values()):  # align to the model's class order by name
+            index = {n: i for i, n in names.items()}
+        else:  # folder names carry no class meaning, e.g. ImageNet wnids under humanized names
+            index = {c: i for i, c in enumerate(classes)}
+        extra = {c for c in classes if index.get(c, len(names)) >= len(names)} if names else set()  # not in the model
+        n = len(self.samples)
+        self.samples = [(f, index[classes[t]]) for f, t in self.samples if classes[t] not in extra]
+        if extra:
+            LOGGER.warning(
+                f"{self.prefix}Skipping {n - len(self.samples)} samples from classes the model lacks: {sorted(extra)}"
+            )
         self.samples = [[*list(x), Path(x[0]).with_suffix(".npy"), None] for x in self.samples]  # file, index, npy, im
         if self.cache_ram:
             self.cache_images()
@@ -1268,7 +1290,7 @@ class ClassificationDataset:
             check_file_speeds([file for (file, _) in self.samples[:5]], prefix=self.prefix)  # check image read speeds
             cache = load_dataset_cache_file(path)  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash([x[0] for x in self.samples])  # identical hash
+            assert cache["hash"] == get_hash([x[0] for x in self.samples] + self.base.classes)  # files and classes
             nf, nc, n, samples = cache.pop("results")  # found, corrupt, total, samples
             if LOCAL_RANK in {-1, 0}:
                 d = f"{desc} {nf} images, {nc} corrupt"
@@ -1295,7 +1317,7 @@ class ClassificationDataset:
                 pbar.close()
             if msgs:
                 LOGGER.info("\n".join(msgs))
-            x["hash"] = get_hash([x[0] for x in self.samples])
+            x["hash"] = get_hash([x[0] for x in self.samples] + self.base.classes)
             x["results"] = nf, nc, len(samples), samples
             x["msgs"] = msgs  # warnings
             save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
