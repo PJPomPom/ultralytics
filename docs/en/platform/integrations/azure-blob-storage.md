@@ -37,12 +37,12 @@ keys**. SAS-token connection strings, which contain `SharedAccessSignature` inst
    manually.
 4. Click **Connect**. Platform verifies it can list and read each selected container before saving anything.
 
-![Ultralytics Platform Azure Blob Storage Integration Settings](https://cdn.ul.run/i/85be53f25bc7085ce898b2a7b3839974.avif)<!-- screenshot -->
+![Ultralytics Platform Azure Blob Storage Integration Settings](https://cdn.ul.run/i/9f607a4743cfbeb6d8dc85145aa45d36.avif)<!-- screenshot -->
 
-You need the workspace admin or owner [role](../account/teams.md#roles-and-permissions) to connect cloud storage. One
-connection carries up to 50 containers, and discovery lists up to 300 containers in the storage account.
+You need the workspace admin or owner [role](../account/teams.md#roles-and-permissions) to connect cloud storage. You
+can add up to 50 containers at a time, and discovery lists up to 300 containers in the storage account.
 
-Reconnecting the same storage account later adds new containers to the existing integration. A saved credential is only replaced once its replacement can still read every container you've already connected.
+Reconnecting the same storage account later adds new containers to the existing integration. A saved credential is only replaced once its replacement can still read every container you've already connected. If any container can't be read, the error names it, including containers connected earlier with the same storage account.
 
 !!! note "Credential security"
 
@@ -67,7 +67,7 @@ The dataset then behaves like any other: browse and [annotate](../data/annotatio
 
 !!! note "Limits"
 
-    A single import indexes up to 50,000 blobs, and label or YAML files up to 1 MB each. Larger containers should be split across multiple datasets.
+    A single import indexes up to 500,000 blobs, and label or YAML files up to 1 MB each. Larger containers should be split across multiple datasets.
 
 !!! warning "Keep indexed blobs immutable"
 
@@ -85,9 +85,11 @@ Managed training works through the normal training flow. Training uses Platform'
 
 ## Disconnect a Connection
 
-Disconnecting deletes the stored connection string without touching anything in Azure. Datasets built from those containers stay in your workspace with their classes, labels, and annotations, but their images cannot be loaded, previewed, or trained on until the same storage account is connected again.
+Disconnecting deletes the stored connection string without touching anything in Azure. Datasets built from those containers stay in your workspace with their classes, labels, and annotations, but their images cannot be loaded, previewed, or trained on until the same storage account is connected again. You can still rename them, edit their labels, or delete them while disconnected.
 
-Use the [REST API](../api/index.md) with the integration ID returned by `GET /api/integrations/buckets`:
+To disconnect, go to **Settings > Integrations**, select **Azure Blob Storage**, click **Disconnect** next to the credential, and confirm. Opening one of its datasets then shows **Azure Blob Storage Disconnected** with a link back to these settings, and the dataset returns automatically once you reconnect.
+
+You can also disconnect with the [REST API](../api/index.md), using the integration ID returned by `GET /api/integrations/buckets`:
 
 ```bash
 curl -X DELETE \
@@ -112,3 +114,21 @@ Azure-backed datasets currently exclude features that require Platform-owned cop
 Deleting an Azure-backed dataset, or individual images from it, removes Platform's references only — your blobs are never touched.
 
 Also see the [Google Cloud Storage](google-cloud-storage.md) and [Amazon S3](amazon-s3.md) integrations.
+
+## FAQ
+
+### Does Platform copy my images?
+
+No. Platform lists the container once and indexes the image dimensions and labels it finds. Originals are streamed on demand for browsing and annotation, and managed training works from Platform's own copies of the pinned images only for the duration of the run. Indexed images do not count against your [storage quota](../account/billing.md).
+
+### What happens if I add or change files in the container?
+
+A dataset is indexed once when it is created. New objects are not picked up until you create a new dataset or retry a failed import, and every indexed image is pinned to its version, so overwriting an object makes Platform fail closed on that image. Add new objects instead of replacing existing ones.
+
+### Why is smart annotation or clustering unavailable on my Azure dataset?
+
+Features that need Platform-owned copies of your images are excluded on connected datasets: auto-annotation, [clustering analysis](../data/datasets.md#clustering), dataset cloning, and immutable [version snapshots](../data/datasets.md#versions-tab). Manual annotation, sharing, and training all work as normal.
+
+### How do I revoke Platform's access?
+
+Disconnect the integration in **Settings > Integrations** to delete the stored credentials, or rotate the storage account access keys in Azure. Neither action touches the data in your containers.

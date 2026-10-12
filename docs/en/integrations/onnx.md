@@ -6,9 +6,9 @@ keywords: YOLO26, ONNX, model export, Ultralytics, ONNX Runtime, machine learnin
 
 # ONNX Export for YOLO26 Models
 
-???+ tip "~43% faster inference."
+???+ tip "~43% faster CPU ONNX inference: YOLO26n vs YOLO11n"
 
-    - Exporting the Ultralytics YOLO26 model to ONNX can deliver up to a 43% boost in inference speed, enabling faster and more efficient deployment.
+    - YOLO26n runs up to 43% faster than YOLO11n on CPU ONNX inference (Intel Xeon CPU @ 2.00 GHz). See the [YOLO26 model page](../models/yolo26.md) for the full comparison.
 
 Often, when deploying [computer vision](https://www.ultralytics.com/glossary/computer-vision-cv) models, you'll need a model format that's both flexible and compatible with multiple platforms.
 
@@ -69,7 +69,7 @@ ONNX models are often deployed on CPUs due to their compatibility with ONNX Runt
 
 While ONNX models are commonly used on CPUs, they can also be deployed on the following platforms:
 
-- **GPU Acceleration**: ONNX fully supports GPU acceleration, particularly NVIDIA CUDA. For native training and inference on AMD GPUs, use [PyTorch ROCm](amd.md); an ONNX file still requires an AMD-compatible runtime.
+- **GPU Acceleration**: ONNX fully supports GPU acceleration on NVIDIA GPUs through CUDA and on [AMD GPUs through ROCm and MIGraphX](amd.md#export-and-inference-with-migraphx).
 
 - **Edge and Mobile Devices**: ONNX extends to edge and mobile devices, perfect for on-device and real-time inference scenarios. It's lightweight and compatible with edge hardware, and serves as the basis for vendor NPU formats such as [Huawei Ascend](ascend.md), [Qualcomm QNN](qnn.md) for Snapdragon devices, and [RKNN](rockchip-rknn.md) for Rockchip NPUs.
 
@@ -179,19 +179,19 @@ The ONNX format supports the [Export](../modes/export.md), [Predict](../modes/pr
 
 When exporting your YOLO26 model to ONNX format, you can customize the process using various arguments to optimize for your specific deployment needs:
 
-| Argument   | Type                      | Default  | Description                                                                                                                                                                                                                     |
-| ---------- | ------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `format`   | `str`                     | `'onnx'` | Target format for the exported model, defining compatibility with various deployment environments.                                                                                                                              |
-| `imgsz`    | `int` or `tuple`          | `640`    | Desired image size for the model input. Can be an integer for square images or a tuple `(height, width)` for specific dimensions.                                                                                               |
-| `quantize` | `int` or `str`            | `None`   | Quantization precision: `16` (FP16) or `8` (INT8 static quantization with ONNX Runtime using calibration images from `data`, producing an `_int8.onnx` model); `32`/unset is FP32. Replaces the deprecated `half`/`int8` flags. |
-| `data`     | `str`                     | `None`   | Dataset YAML used for INT8 calibration; classification instead takes a dataset directory or a built-in dataset name. If omitted with `quantize=8`, Ultralytics selects the default calibration dataset for the model task.      |
-| `fraction` | `float`, `int`, or `list` | `1.0`    | Calibration subset as a ratio, image count, or `[train, val]` ratios/counts; a list limits `train` or `val`, while `test` remains full.                                                                                         |
-| `dynamic`  | `bool`                    | `False`  | Allows dynamic input sizes, enhancing flexibility in handling varying image dimensions.                                                                                                                                         |
-| `simplify` | `bool`                    | `True`   | Simplifies the model graph with `onnxslim`, potentially improving performance and compatibility.                                                                                                                                |
-| `opset`    | `int`                     | `None`   | Specifies the ONNX opset version for compatibility with different ONNX parsers and runtimes. If not set, uses the latest supported version.                                                                                     |
-| `nms`      | `bool`                    | `False`  | Adds Non-Maximum Suppression (NMS), essential for accurate and efficient detection post-processing.                                                                                                                             |
-| `batch`    | `int`                     | `1`      | Specifies export model batch inference size or the max number of images the exported model will process concurrently in `predict` mode.                                                                                         |
-| `device`   | `str`                     | `None`   | Specifies the device for exporting: GPU (`device=0`), CPU (`device=cpu`), MPS for Apple silicon (`device=mps`).                                                                                                                 |
+| Argument   | Type                      | Default  | Description                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------- | ------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `format`   | `str`                     | `'onnx'` | Target format for the exported model, defining compatibility with various deployment environments.                                                                                                                                                                                                                                                                                         |
+| `imgsz`    | `int` or `tuple`          | `640`    | Desired image size for the model input. Can be an integer for square images or a tuple `(height, width)` for specific dimensions.                                                                                                                                                                                                                                                          |
+| `quantize` | `int` or `str`            | `None`   | Quantization precision: `16` (FP16) or `8` (INT8 static quantization with ONNX Runtime using calibration images from `data`, producing an `_int8.onnx` model); `32`/unset is FP32. A checkpoint trained with `quantize=8` always exports INT8 as Q/DQ nodes from the ranges it carries, without calibration and under the plain `.onnx` name. Replaces the deprecated `half`/`int8` flags. |
+| `data`     | `str`                     | `None`   | Dataset YAML used for INT8 calibration; classification instead takes a dataset directory or a built-in dataset name. If omitted with `quantize=8`, Ultralytics selects the default calibration dataset for the model task; a checkpoint trained with `quantize=8` needs none.                                                                                                              |
+| `fraction` | `float`, `int`, or `list` | `1.0`    | Calibration subset as a ratio, image count, or `[train, val, test]` ratios/counts. Two-item lists leave `test` full, while `0` skips it.                                                                                                                                                                                                                                                   |
+| `dynamic`  | `bool`                    | `False`  | Allows dynamic input sizes, enhancing flexibility in handling varying image dimensions.                                                                                                                                                                                                                                                                                                    |
+| `simplify` | `bool`                    | `True`   | Simplifies the model graph with `onnxslim`, potentially improving performance and compatibility.                                                                                                                                                                                                                                                                                           |
+| `opset`    | `int`                     | `None`   | Specifies the ONNX opset version for compatibility with different ONNX parsers and runtimes. If not set, uses the latest supported version.                                                                                                                                                                                                                                                |
+| `nms`      | `bool`, optional          | `None`   | Select raw output (`None`, default), embedded NMS (`True`), or the NMS-free head (`False`).                                                                                                                                                                                                                                                                                                |
+| `batch`    | `int`                     | `1`      | Specifies export model batch inference size or the max number of images the exported model will process concurrently in `predict` mode.                                                                                                                                                                                                                                                    |
+| `device`   | `str`                     | `None`   | Specifies the device for exporting: GPU (`device=0`), CPU (`device=cpu`), MPS for Apple silicon (`device=mps`).                                                                                                                                                                                                                                                                            |
 
 For more details about the export process, visit the [Ultralytics documentation page on exporting](../modes/export.md).
 
@@ -206,6 +206,10 @@ Once you've successfully exported your Ultralytics YOLO26 models to ONNX format,
 - **[ONNX Tutorials on GitHub](https://github.com/onnx/tutorials)**: A collection of comprehensive tutorials that cover various aspects of using and implementing ONNX models in different scenarios.
 
 - **[Triton Inference Server](../guides/triton-inference-server.md)**: Learn how to deploy your ONNX models with NVIDIA's Triton Inference Server for high-performance, scalable deployments.
+
+## AMD GPU Inference with MIGraphX
+
+Ultralytics runs exported ONNX models on AMD GPUs through the ONNX Runtime [MIGraphX execution provider](https://onnxruntime.ai/docs/execution-providers/MIGraphX-ExecutionProvider.html). On a ROCm (HIP) system, the ONNX backend installs the `onnxruntime-ep-migraphx` plugin on first use and selects `MIGraphXExecutionProvider` automatically with no code changes, and all YOLO26 tasks are supported. See the [AMD GPU inference guide](amd.md) for prerequisites, installation, usage, [benchmarks](amd.md#benchmarks), and the compiled-program cache.
 
 ## Summary
 
@@ -271,7 +275,8 @@ Learn more by checking the [ONNX Runtime documentation](https://onnxruntime.ai/d
 YOLO26 models exported to ONNX can be deployed on various platforms including:
 
 - **CPUs**: Utilizing ONNX Runtime for optimized CPU inference.
-- **GPUs**: Leveraging NVIDIA CUDA for high-performance GPU acceleration.
+- **NVIDIA GPUs**: Leveraging NVIDIA CUDA for high-performance GPU acceleration.
+- **AMD GPUs**: Using [AMD ROCm and the MIGraphX execution provider](amd.md) for high-performance GPU acceleration on Linux.
 - **Edge devices**: Running lightweight models on edge and mobile devices for real-time, on-device inference.
 - **Web browsers**: Executing models directly within web browsers for interactive web-based applications.
 - **Cloud services**: Deploying on cloud platforms that support ONNX format for scalable inference.

@@ -55,8 +55,8 @@ Knowledge distillation improves student [mAP](yolo-performance-metrics.md) acros
 | [YOLO26l-distill](https://platform.ultralytics.com/ultralytics/yolo26) | 640                         | 55.0                                   | **56.0**                                | 54.4                                         | **55.5**                                      |
 | [YOLO26x-distill](https://platform.ultralytics.com/ultralytics/yolo26) | 640                         | 57.5                                   | **57.9**                                | 56.9                                         | **57.4**                                      |
 
-- **mAP<sup>val</sup>** values are for single-model single-scale on the [COCO val2017](https://cocodataset.org/) dataset. <br>Reproduce a distilled row with `yolo val detect model=yolo26n-distill.pt data=coco.yaml device=0`; add `end2end=False` for the non-e2e column.
-- **e2e** values use the default NMS-free inference path; non-e2e values use traditional NMS post-processing (`end2end=False`). See [End-to-End Detection](end2end-detection.md) for details.
+- **mAP<sup>val</sup>** values are for single-model single-scale on the [COCO val2017](https://cocodataset.org/) dataset. <br>Reproduce a distilled row with `yolo val detect model=yolo26n-distill.pt data=coco.yaml device=0`; add `nms=False` for the e2e column.
+- **e2e** values use the NMS-free inference path (`nms=False`); non-e2e values use default NMS post-processing (`nms=None`). See [End-to-End Detection](end2end-detection.md) for details.
 
 ## Prerequisites
 
@@ -95,32 +95,14 @@ Cross-family distillation (e.g., YOLO11 teacher with YOLO26 student) is **not su
 
 ```mermaid
 flowchart TD
-    A[Input Image Batch]:::start --> T[Teacher Model<br/>frozen, eval mode]:::extern
-    A --> S[Student Model<br/>trainable]:::proc
-
-    T --> |Detect head inputs| TF[Teacher Features]:::extern
-    S --> |Detect head inputs| SF[Student Features]:::proc
-
-    SF --> P[1×1 Conv Projector<br/>with ReLU]:::decide
-    P --> AF[Aligned Student Features]:::proc
-
-    TF --> SW[Score-weighted L2 Loss]:::proc
-    AF --> SW
-
-    S --> D[Detection Head]:::proc
-    D --> DL[box_loss + cls_loss + l1_loss]:::proc
-
-    SW --> |× dis| DIS[distillation loss]:::proc
-    DL --> TOTAL[Total Loss]:::out
-    DIS --> TOTAL
-
-    TOTAL --> BP[Backpropagate<br/>Student + Projector only]:::out
-
-    classDef start fill:#4CAF50,color:#fff
-    classDef proc fill:#2196F3,color:#fff
-    classDef decide fill:#FF9800,color:#fff
-    classDef out fill:#9C27B0,color:#fff
-    classDef extern fill:#607D8B,color:#fff
+    A([Image batch]) --> T[Teacher]
+    A --> S[Student]
+    S --> P[Projector]
+    T --> L[Score-weighted L2 loss]
+    P --> L
+    S -->|task losses| W[Total loss]
+    L -->|× dis| W
+    W --> B([Update student, projector])
 ```
 
 ## Task Support

@@ -3,35 +3,39 @@
 Check a model's accuracy on a test or val split of a dataset.
 
 Usage:
-    $ yolo mode=val model=yolo26n.pt data=coco8.yaml imgsz=640
+    $ yolo val model=yolo26n.pt data=coco8.yaml imgsz=640
 
 Usage - formats:
-    $ yolo mode=val model=yolo26n.pt                 # PyTorch
-                          yolo26n.torchscript        # TorchScript
-                          yolo26n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
-                          yolo26n_openvino_model     # OpenVINO
-                          yolo26n.engine             # TensorRT
-                          yolo26n.mlpackage          # CoreML (macOS-only)
-                          yolo26n_saved_model        # TensorFlow SavedModel
-                          yolo26n.pb                 # TensorFlow GraphDef
-                          yolo26n_edgetpu.tflite     # TensorFlow Edge TPU
-                          yolo26n_paddle_model       # PaddlePaddle
-                          yolo26n.mnn                # MNN
-                          yolo26n_ncnn_model         # NCNN
-                          yolo26n_imx_model          # Sony IMX
-                          yolo26n_rknn_model         # Rockchip RKNN
-                          yolo26n_executorch_model   # ExecuTorch
-                          yolo26n_axelera_model      # Axelera AI
-                          yolo26n_deepx_model        # DEEPX
-                          yolo26n_qnn.onnx           # Qualcomm QNN
-                          yolo26n.tflite             # LiteRT
-                          yolo26n_ascend_model       # Huawei Ascend
+    $ yolo val model=yolo26n.pt                 # PyTorch
+                     yolo26n.torchscript        # TorchScript
+                     yolo26n.onnx               # ONNX Runtime or OpenCV DNN with dnn=True
+                     yolo26n_openvino_model     # OpenVINO
+                     yolo26n.engine             # TensorRT
+                     yolo26n.mlpackage          # CoreML (macOS-only)
+                     yolo26n.aimodel            # Apple Core AI
+                     yolo26n_saved_model        # TensorFlow SavedModel
+                     yolo26n.pb                 # TensorFlow GraphDef
+                     yolo26n_edgetpu.tflite     # TensorFlow Edge TPU
+                     yolo26n.tflite             # LiteRT
+                     yolo26n_paddle_model       # PaddlePaddle
+                     yolo26n.mnn                # MNN
+                     yolo26n_ncnn_model         # NCNN
+                     yolo26n_imx_model          # Sony IMX
+                     yolo26n_rknn_model         # Rockchip RKNN
+                     yolo26n_executorch_model   # ExecuTorch
+                     yolo26n_axelera_model      # Axelera AI
+                     yolo26n_deepx_model        # DEEPX
+                     yolo26n_qnn.onnx           # Qualcomm QNN
+                     yolo26n_hailo_model        # Hailo
+                     yolo26n_ascend_model       # Huawei Ascend
+                     yolo26n_xilinx_model       # AMD Xilinx
 """
 
 from __future__ import annotations
 
 import json
 import time
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -68,11 +72,11 @@ class BaseValidator:
         data (dict): Data dictionary containing dataset information.
         device (torch.device): Device to use for validation.
         batch_i (int): Current batch index.
-        training (bool): Whether the model is in training mode.
+        training (bool): Whether validation is running during training.
         names (dict): Class names mapping.
         seen (int): Number of images seen so far during validation.
         stats (dict): Statistics collected during validation.
-        confusion_matrix: Confusion matrix for classification evaluation.
+        confusion_matrix (ConfusionMatrix): Confusion matrix of predictions versus ground truth.
         nc (int): Number of classes.
         iouv (torch.Tensor): IoU thresholds from 0.50 to 0.95 in steps of 0.05.
         jdict (list): List to store JSON validation results.
@@ -87,6 +91,7 @@ class BaseValidator:
     Methods:
         __call__: Execute validation process, running inference on dataloader and computing performance metrics.
         match_predictions: Match predictions to ground truth objects using IoU.
+        get_model: Return the training EMA or an independent model for standalone validation.
         add_callback: Append the given callback to the specified event.
         run_callbacks: Run all callbacks associated with a specified event.
         get_dataloader: Get data loader from dataset path and batch size.
@@ -97,6 +102,7 @@ class BaseValidator:
         update_metrics: Update metrics based on predictions and batch.
         finalize_metrics: Finalize and return all metrics.
         get_stats: Return statistics about the model's performance.
+        gather_stats: Gather statistics from all GPUs during DDP training.
         print_results: Print the results of the model's predictions.
         get_desc: Get description of the YOLO model.
         on_plot: Register plots for visualization.
@@ -112,7 +118,7 @@ class BaseValidator:
         Args:
             dataloader (torch.utils.data.DataLoader, optional): DataLoader to be used for validation.
             save_dir (Path, optional): Directory to save results.
-            args (SimpleNamespace, optional): Configuration for the validator.
+            args (dict | SimpleNamespace, optional): Configuration for the validator.
             _callbacks (dict, optional): Dictionary to store various callback functions.
         """
         import torchvision  # noqa (import here so torchvision import time not recorded in postprocess time)
@@ -143,26 +149,27 @@ class BaseValidator:
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
 
     @smart_inference_mode()
-    def __call__(self, trainer=None, model=None):
+    def __call__(self, trainer=None, model=None, **kwargs):
         """Execute validation process, running inference on dataloader and computing performance metrics.
 
         Args:
             trainer (object, optional): Trainer object that contains the model to validate.
             model (nn.Module, optional): Model to validate if not using a trainer.
+            **kwargs (Any): Task-specific model preparation arguments.
 
         Returns:
-            (dict): Dictionary containing validation statistics.
+            (dict | None): Dictionary containing validation statistics, or None on non-zero DDP ranks during training.
         """
         self.training = trainer is not None
+        model = self.get_model(model, trainer, **kwargs)
         augment = self.args.augment and (not self.training)
         if self.training:
+            if hasattr(model, "end2end"):
+                model.end2end = self.args.nms is False
             self.device = trainer.device
             self.data = trainer.data
             # Keep training validation read-only: inputs may be fp16, but EMA/model weights stay fp32 under autocast.
             self.args.quantize = 16 if (self.device.type != "cpu" and trainer.amp) else None
-            model = trainer.ema.ema or trainer.model
-            if trainer.args.compile and hasattr(model, "_orig_mod"):
-                model = model._orig_mod  # validate non-compiled original model to avoid issues
             model = model.float()
             self.loss = {k: torch.zeros_like(v) for k, v in trainer.loss_items.items()}
             self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
@@ -171,13 +178,10 @@ class BaseValidator:
             if str(self.args.model).endswith(".yaml") and model is None:
                 LOGGER.warning("validating an untrained model YAML will result in 0 mAP.")
             callbacks.add_integration_callbacks(self)
-            if hasattr(model, "end2end"):
-                if self.args.end2end is not None:
-                    model.end2end = self.args.end2end
-                if model.end2end:
-                    model.set_head_attr(max_det=self.args.max_det, agnostic_nms=self.args.agnostic_nms)
             with torch_distributed_zero_first(LOCAL_RANK):
-                self.args.data = convert_ndjson_to_yolo_if_needed(self.args.data, self.args.fraction)
+                self.args.data = convert_ndjson_to_yolo_if_needed(
+                    self.args.data, self.args.fraction, split=self.args.split
+                )
             device_type = str(self.args.device).split(":", 1)[0]
             device_type = device_type if device_type in {"npu", "xpu"} else "cuda"
             model = AutoBackend(
@@ -189,6 +193,8 @@ class BaseValidator:
                 dnn=self.args.dnn,
                 data=self.args.data,
                 fp16=self.args.quantize == 16,
+                channels_last=self.args.channels_last,
+                end2end=self.args.nms is False,
             )
             self.device = model.device  # update device
             self.args.quantize = 16 if model.fp16 else None  # record actual inference precision
@@ -197,19 +203,10 @@ class BaseValidator:
             if augment and not model.base_model:
                 LOGGER.warning(f"'augment' is not supported by this model (format='{fmt}'), ignoring.")
                 augment = False
-            # Same gate as predictor.setup_model: NHWC is lossless only for native PyTorch models on CUDA.
-            channels_last = self.args.channels_last and self.device.type == "cuda" and pt
-            if self.args.channels_last and not channels_last:
-                LOGGER.warning(
-                    f"'channels_last=True' applies only to native PyTorch models on CUDA, ignoring for "
-                    f"format='{fmt}' on '{self.device.type}'."
-                )
-            if channels_last:
-                model.to(memory_format=torch.channels_last)
             imgsz = check_imgsz(self.args.imgsz, stride=stride)
+            if fmt != "pt" and hasattr(model, "imgsz") and not getattr(model, "dynamic", False):
+                self.args.imgsz = imgsz = max(model.imgsz)  # reuse square imgsz from export metadata
             if fmt not in {"pt", "torchscript"} and not getattr(model, "dynamic", False):
-                if hasattr(model, "imgsz"):
-                    self.args.imgsz = imgsz = max(model.imgsz)  # reuse square imgsz from export metadata
                 self.args.batch = model.metadata.get("batch", 1)  # export.py models default to batch-size 1
                 LOGGER.info(f"Setting batch={self.args.batch} input of shape ({self.args.batch}, 3, {imgsz}, {imgsz})")
 
@@ -232,6 +229,7 @@ class BaseValidator:
             if not (pt or (getattr(model, "dynamic", False) and fmt != "imx")):
                 self.args.rect = False
             self.stride = model.stride  # used in get_dataloader() for padding
+            self.names = model.names  # used in get_dataloader() to filter classification samples
             self.dataloader = self.dataloader or self.get_dataloader(self.data.get(self.args.split), self.args.batch)
 
             model.eval()
@@ -321,13 +319,14 @@ class BaseValidator:
         """Match predictions to ground truth objects using IoU.
 
         Args:
-            pred_classes (torch.Tensor): Predicted class indices of shape (N,).
+            pred_classes (torch.Tensor): Predicted class indices of shape (N,), ordered by descending confidence.
             true_classes (torch.Tensor): Target class indices of shape (M,).
-            iou (torch.Tensor): An NxM tensor containing the pairwise IoU values for predictions and ground truth.
+            iou (torch.Tensor): An MxN tensor containing the pairwise IoU values for ground truth (rows) and predictions
+                (columns).
             use_scipy (bool, optional): Whether to use Hungarian one-to-one matching (more precise).
 
         Returns:
-            (torch.Tensor): Correct tensor of shape (N, 10) for 10 IoU thresholds.
+            (torch.Tensor): Boolean correct tensor of shape (N, T) for T IoU thresholds (10 by default).
         """
         # Dx10 matrix, where D - detections, 10 - IoU thresholds
         correct = np.zeros((pred_classes.shape[0], self.iouv.shape[0])).astype(bool)
@@ -335,24 +334,36 @@ class BaseValidator:
         correct_class = true_classes[:, None] == pred_classes
         iou = iou * correct_class  # zero out the wrong classes
         iou = iou.cpu().numpy()
-        for i, threshold in enumerate(self.iouv.cpu().tolist()):
-            if use_scipy:
+        thresholds = self.iouv.cpu().numpy()
+        if use_scipy:
+            for i, threshold in enumerate(thresholds):
                 cost_matrix = iou * (iou >= threshold)
                 if cost_matrix.any():
                     labels_idx, detections_idx = linear_sum_assignment(-cost_matrix)  # negate to maximize IoU
                     valid = cost_matrix[labels_idx, detections_idx] > 0
                     if valid.any():
                         correct[detections_idx[valid], i] = True
-            else:
-                matches = np.nonzero(iou >= threshold)  # IoU > threshold and classes match
-                matches = np.array(matches).T
-                if matches.shape[0]:
-                    if matches.shape[0] > 1:
-                        matches = matches[iou[matches[:, 0], matches[:, 1]].argsort()[::-1]]
-                        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-                    correct[matches[:, 1].astype(int), i] = True
+        else:
+            matched = np.zeros((iou.shape[0], len(thresholds)), dtype=bool)  # targets claimed at each threshold
+            for j in np.flatnonzero((iou >= thresholds.min()).any(0)):  # detections in descending confidence order
+                available = np.where(matched, 0, iou[:, j, None])  # IoU with each unclaimed target per threshold
+                k = available.argmax(0)  # best unclaimed target per threshold
+                correct[j] = available[k, range(len(thresholds))] >= thresholds
+                matched[k, range(len(thresholds))] |= correct[j]
         return torch.from_numpy(correct)
+
+    @smart_inference_mode(False)
+    def get_model(self, model, trainer=None):
+        """Return the training EMA or an independent model for standalone validation.
+
+        Args:
+            model (torch.nn.Module | str | Path | None): Model or checkpoint for standalone validation.
+            trainer (object, optional): Trainer whose EMA is used during training validation.
+
+        Returns:
+            (torch.nn.Module | str | Path | None): Model to prepare for inference.
+        """
+        return trainer.ema.ema if trainer is not None else deepcopy(model)
 
     def add_callback(self, event: str, callback):
         """Append the given callback to the specified event."""
