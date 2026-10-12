@@ -20,13 +20,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.utils.fusion import fuse_conv_bn_weights
+from torch.utils._pytree import tree_flatten
 
 from ultralytics import __version__
 from ultralytics.utils import (
+    ARM64,
     DEFAULT_CFG_DICT,
     DEFAULT_CFG_KEYS,
     LOCAL_RANK,
     LOGGER,
+    MACOS,
     NUM_THREADS,
     PYTHON_VERSION,
     TORCH_VERSION,
@@ -121,7 +124,11 @@ def autocast(enabled: bool | torch.dtype, device: str = "cuda"):
     Returns:
         (torch.amp.autocast): The appropriate autocast context manager.
 
+    Raises:
+        RuntimeError: If bfloat16 is requested without torch>=1.13 and a CUDA device with native bfloat16 support.
+
     Examples:
+        >>> from ultralytics.utils.torch_utils import autocast
         >>> with autocast(enabled=True):
         ...     # Your mixed precision operations here
         ...     pass
@@ -152,18 +159,18 @@ def autocast(enabled: bool | torch.dtype, device: str = "cuda"):
             device, enabled = "cpu", False
         return torch.amp.autocast(device, enabled=enabled, **kwargs)
     else:
-        return torch.cuda.amp.autocast(enabled)
+        return torch.cuda.amp.autocast(enabled and device == "cuda")
 
 
 @functools.lru_cache
 def get_cpu_info():
-    """Return a string with system CPU information, i.e. 'Apple M2'."""
+    """Return a string with system CPU information, e.g. 'Apple M2'."""
     return CPUInfo.name()
 
 
 @functools.lru_cache
 def get_gpu_info(index):
-    """Return a string with system GPU information, i.e. 'Tesla T4, 15102MiB'."""
+    """Return a string with system GPU information, e.g. 'Tesla T4, 15102MiB'."""
     properties = torch.cuda.get_device_properties(index)
     return f"{properties.name}, {properties.total_memory / (1 << 20):.0f}MiB"
 
@@ -196,6 +203,8 @@ def parse_device(device: str | int | list | tuple | torch.device = "") -> str:
     if isinstance(device, torch.device):
         if device.type == "cuda" and device.index is None:
             return ""  # indexless torch.device('cuda') means the current CUDA device, i.e. the '' default request
+        if device.type == "cpu":
+            return "cpu"  # an indexed torch.device('cpu', 0) is the same cpu
         if device.type in {"npu", "xpu"}:
             return device.type if device.index is None else f"{device.type}:{device.index}"
     device = str(device).lower()
@@ -237,19 +246,23 @@ def parse_device(device: str | int | list | tuple | torch.device = "") -> str:
 def select_device(device="", newline=False, verbose=True):
     """Select the appropriate PyTorch device based on the provided arguments.
 
-    The function takes a string specifying the device or a torch.device object and returns a torch.device object
+    The function takes a device request (see `parse_device`) or a torch.device object and returns a torch.device object
     representing the selected device. The function also validates the number of available devices and raises an
     exception if the requested device(s) are not available.
 
     Args:
-        device (str | torch.device, optional): Device string or torch.device object. Options include 'cpu', 'cuda', '0',
-            '0,1,2,3', 'mps', 'npu:0', 'npu:0,1', 'xpu:0', 'xpu:0,1', or '-1' for auto-select. Defaults to auto-selecting
-            the first available GPU, or CPU if no GPU is available.
+        device (str | int | list | tuple | torch.device, optional): Device request or torch.device object. Options
+            include 'cpu', 'cuda', '0', '0,1,2,3', 'mps', 'npu:0', 'npu:0,1', 'xpu:0', 'xpu:0,1', or '-1' to auto-select
+            an idle GPU. Defaults to the current CUDA device, or CPU if no GPU is available.
         newline (bool, optional): If True, adds a newline at the end of the log string.
         verbose (bool, optional): If True, logs the device information.
 
     Returns:
-        (torch.device): Selected device.
+        (torch.device | str): Selected device. For multi-GPU requests this is the first GPU. 'tpu', 'intel', and
+            'vulkan' device strings and other non-cpu/cuda/npu/xpu torch.device inputs are returned unchanged.
+
+    Raises:
+        ValueError: If the requested CUDA, NPU, or XPU device(s) are invalid or unavailable.
 
     Examples:
         >>> select_device("cuda:0")
@@ -266,8 +279,8 @@ def select_device(device="", newline=False, verbose=True):
         the current device untouched.
     """
     if isinstance(device, torch.device):
-        if device.type not in {"cuda", "npu", "xpu"}:
-            return device  # other torch.device inputs pass through; accelerator inputs canonicalize and validate below
+        if device.type not in {"cpu", "cuda", "npu", "xpu"}:
+            return device  # other torch.device inputs pass through; cpu and accelerator inputs canonicalize below
     elif str(device).startswith(("tpu", "intel", "vulkan")):
         return device
 
@@ -351,13 +364,15 @@ def select_device(device="", newline=False, verbose=True):
 
     if arg in {"cpu", "mps"}:
         torch.set_num_threads(NUM_THREADS)  # reset OMP_NUM_THREADS for cpu training
+    if arg == "cpu" and MACOS and ARM64 and TORCH_2_3:
+        torch.backends.nnpack.set_flags(False)  # NNPACK conv2d at batch>=16 is 6x slower than im2col on Apple silicon
     if verbose:
         LOGGER.info(s if newline else s.rstrip())
     return torch.device(arg)
 
 
 def time_sync(device: torch.device | None = None):
-    """Return PyTorch-accurate time."""
+    """Return PyTorch-accurate time, synchronizing the accelerator first unless the device is CPU or MPS."""
     if device is None or device.type not in {"cpu", "mps"}:
         accelerator = get_torch_device_backend(device or "cuda")
         if accelerator.is_available() and hasattr(accelerator, "synchronize"):
@@ -535,10 +550,10 @@ def model_info(model, detailed=False, verbose=True, imgsz=640):
         model (nn.Module): Model to analyze.
         detailed (bool, optional): Whether to print detailed layer information.
         verbose (bool, optional): Whether to print model information.
-        imgsz (int | list, optional): Input image size.
+        imgsz (int | list | tuple, optional): Input image size, an int or an (h, w) pair.
 
     Returns:
-        (tuple): Tuple containing:
+        (tuple | None): Tuple containing the following, or None if `verbose` is False:
             - n_l (int): Number of layers.
             - n_p (int): Number of parameters.
             - n_g (int): Number of gradients.
@@ -616,29 +631,16 @@ def model_info_for_loggers(trainer):
     return results
 
 
-def _attention_ops(m, x, y):
-    """Count the query-key and attention-value matmuls of an attention block for THOP.
-
-    Both run functionally on reshaped tensors, so no child-module hook observes them and the block would otherwise be
-    charged only for its qkv/proj/pe convolutions. Each output element of the two products costs one multiply-add over
-    the contracted axis, giving `tokens**2 * (key_dim + head_dim)` per head.
-    """
-    b, _, h, w = x[0].shape
-    area = getattr(m, "area", 1)  # area attention attends within that many independent groups, AAttn only
-    tokens = h * w // area
-    key_dim = getattr(m, "key_dim", m.head_dim)  # Attention narrows q and k by attn_ratio, AAttn does not
-    m.total_ops += b * area * m.num_heads * tokens * tokens * (key_dim + m.head_dim)
-
-
 def get_flops(model, imgsz=640):
     """Calculate FLOPs (floating point operations) for a model in GFLOPs.
 
-    Uses THOP's stride-aware image profiling for efficiency and accurate size-independent operations. Returns 0.0 if
+    Uses THOP's stride-aware image profiling, which extrapolates exactly from small stride-aligned proxy images, with
+    the proxies widened past the anchor count at which an RT-DETR decoder's query selection saturates. Returns 0.0 if
     thop is unavailable or profiling fails.
 
     Args:
         model (nn.Module): The model to calculate FLOPs for.
-        imgsz (int | list, optional): Input image size.
+        imgsz (int | list | tuple, optional): Input image size, an int or an (h, w) pair.
 
     Returns:
         (float): The model's GFLOPs (billions of floating point operations).
@@ -652,22 +654,19 @@ def get_flops(model, imgsz=640):
         return 0.0  # if not installed return 0.0 GFLOPs
 
     try:
-        from ultralytics.nn.modules.block import AAttn, Attention  # imported here: block.py imports this module
-        from ultralytics.nn.modules.head import RTDETRDecoder
+        from ultralytics.nn.modules.head import RTDETRDecoder  # imported here: head.py imports this module
 
         model = unwrap_model(model)
         p = next(model.parameters())
-        if not isinstance(imgsz, list):
+        if not isinstance(imgsz, (list, tuple)):
             imgsz = [imgsz, imgsz]  # expand if int/float
-        attn = tuple(m for m in model.modules() if isinstance(m, (Attention, AAttn)))
-        rtdetr = any(isinstance(m, RTDETRDecoder) for m in model.modules())
-        # Attention costs are quadratic in image area, so disable THOP's affine proxy.
-        stride = None if attn else max(int(model.stride.max()), 32) if hasattr(model, "stride") else 32
+        stride = max(int(model.stride.max()), 32) if hasattr(model, "stride") else 32
+        # an RT-DETR decoder selects num_queries anchors, and a stride cell holds (4**nl - 1) / 3 anchors over nl levels
+        min_cells = max(
+            (-(-m.num_queries * 3 // (4**m.nl - 1)) for m in model.modules() if isinstance(m, RTDETRDecoder)), default=1
+        )
         im = torch.empty((1, p.shape[1], *imgsz), device=p.device, dtype=p.dtype)  # input image in BCHW format
-        custom_ops = {Attention: _attention_ops, AAttn: _attention_ops} if attn else None
-        if rtdetr:  # RT-DETR cannot run the stride-sized proxy input
-            return thop.profile(model, inputs=[im], custom_ops=custom_ops, verbose=False)[0] / 1e9 * 2
-        return thop.profile(model, inputs=[im], stride=stride, custom_ops=custom_ops, verbose=False)[0] / 1e9 * 2
+        return thop.profile(model, inputs=[im], stride=stride, min_cells=min_cells, verbose=False)[0] / 1e9 * 2
     except Exception:
         return 0.0
 
@@ -687,9 +686,9 @@ def scale_img(img, ratio=1.0, same_shape=False, gs=32):
     """Scale and pad an image tensor, optionally maintaining aspect ratio and padding to gs multiple.
 
     Args:
-        img (torch.Tensor): Input image tensor.
+        img (torch.Tensor): Input image tensor with shape (B, C, H, W).
         ratio (float, optional): Scaling ratio.
-        same_shape (bool, optional): Whether to maintain the same shape.
+        same_shape (bool, optional): Whether to pad or crop back to the original shape instead of a gs multiple.
         gs (int, optional): Grid size for padding.
 
     Returns:
@@ -707,6 +706,8 @@ def scale_img(img, ratio=1.0, same_shape=False, gs=32):
 
 def copy_attr(a, b, include=(), exclude=()):
     """Copy attributes from object 'b' to object 'a', with options to include/exclude certain attributes.
+
+    Private attributes (names starting with '_') are never copied.
 
     Args:
         a (Any): Destination object to copy attributes to.
@@ -903,7 +904,7 @@ def strip_optimizer(f: str | Path = "best.pt", s: str = "", updates: dict[str, A
         updates (dict, optional): A dictionary of updates to overlay onto the checkpoint before saving.
 
     Returns:
-        (dict): The combined checkpoint dictionary.
+        (dict): The combined checkpoint dictionary, or an empty dict if 'f' is not a valid Ultralytics checkpoint.
 
     Examples:
         >>> from pathlib import Path
@@ -947,7 +948,7 @@ def strip_optimizer(f: str | Path = "best.pt", s: str = "", updates: dict[str, A
 
     # Update other keys
     args = {**DEFAULT_CFG_DICT, **x.get("train_args", {})}  # combine args
-    for k in "optimizer", "best_fitness", "ema", "updates", "scaler":  # keys
+    for k in "optimizer", "best_fitness", "stopper", "ema", "updates", "scaler":  # keys
         x[k] = None
     x["epoch"] = -1
     x["train_args"] = {k: v for k, v in args.items() if k in DEFAULT_CFG_KEYS}  # strip non-default keys
@@ -963,6 +964,8 @@ def strip_optimizer(f: str | Path = "best.pt", s: str = "", updates: dict[str, A
 
 def convert_optimizer_state_dict_to_fp16(state_dict):
     """Convert the state_dict of a given optimizer to FP16, focusing on the 'state' key for tensor conversions.
+
+    FP32 tensors are converted in place, except 'step' and 'exp_avg_sq', which are kept in FP32.
 
     Args:
         state_dict (dict): Optimizer state dictionary.
@@ -986,10 +989,11 @@ def cuda_memory_usage(device=None):
     then records the reserved memory on the specified device.
 
     Args:
-        device (torch.device, optional): The accelerator device to query memory usage for.
+        device (torch.device, optional): The accelerator device to query memory usage for. CPU and MPS devices are not
+            measured.
 
     Yields:
-        (dict): A dictionary with a key 'memory' initialized to 0, updated with reserved memory.
+        (dict): A dictionary with a key 'memory' initialized to 0, updated with reserved memory in bytes.
     """
     info = {"memory": 0}
     if device is not None and device.type in {"cpu", "mps"}:
@@ -1011,13 +1015,15 @@ def profile_ops(input, ops, n=10, device=None, max_num_obj=0):
 
     Args:
         input (torch.Tensor | list): Input tensor(s) to profile.
-        ops (nn.Module | list): Model or list of operations to profile.
+        ops (nn.Module | Callable | list): Model, callable, or list of operations to profile.
         n (int, optional): Number of iterations to average.
         device (str | torch.device, optional): Device to profile on.
-        max_num_obj (int, optional): Maximum number of objects for simulation.
+        max_num_obj (int, optional): Maximum number of objects per image used to simulate training-loss memory for
+            AutoBatch. Requires `ops` to have `stride` and `names` attributes. 0 disables the simulation.
 
     Returns:
-        (list): Profile results for each operation.
+        (list): Profile results for each input and operation pair, each either a list of [parameters, GFLOPs, memory
+            (GB), forward time (ms), backward time (ms), input shape, output shape] or None if profiling failed.
 
     Examples:
         >>> from ultralytics.utils.torch_utils import profile_ops
@@ -1032,8 +1038,7 @@ def profile_ops(input, ops, n=10, device=None, max_num_obj=0):
         thop = None  # conda support without 'ultralytics-thop' installed
 
     results = []
-    if not isinstance(device, torch.device):
-        device = select_device(device)
+    device = select_device(device, verbose=False)
     LOGGER.info(
         f"{'Params':>12s}{'GFLOPs':>12s}{'GPU_mem (GB)':>14s}{'forward (ms)':>14s}{'backward (ms)':>14s}"
         f"{'input':>24s}{'output':>24s}"
@@ -1062,7 +1067,7 @@ def profile_ops(input, ops, n=10, device=None, max_num_obj=0):
                         y = m(x)
                         t[1] = time_sync(device)
                         try:
-                            (sum(yi.sum() for yi in y) if isinstance(y, list) else y).sum().backward()
+                            sum(yi.sum() for yi in tree_flatten(y)[0] if isinstance(yi, torch.Tensor)).backward()
                             t[2] = time_sync(device)
                         except Exception:  # no backward method
                             # print(e)  # for debug
@@ -1110,7 +1115,8 @@ class EarlyStopping:
         """Initialize early stopping object.
 
         Args:
-            patience (int, optional): Number of epochs to wait after fitness stops improving before stopping.
+            patience (int, optional): Number of epochs to wait after fitness stops improving before stopping. 0 or None
+                disables early stopping. The trainer always passes the cfg `patience` value (100 by default).
         """
         self.best_fitness = 0.0  # i.e. mAP
         self.best_epoch = 0
@@ -1173,13 +1179,20 @@ def attempt_compile(
     Returns:
         (torch.nn.Module): Compiled model if compilation succeeds, otherwise the original unmodified model.
 
+    Raises:
+        ValueError: If the model carries QAT fake-quantization modules, which do not support torch.compile.
+
     Examples:
+        >>> import torch
+        >>> from ultralytics.utils.torch_utils import attempt_compile
         >>> device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        >>> model = torch.nn.Conv2d(3, 16, 3).to(device)
         >>> # Try to compile and warm up a model with a 640x640 input
         >>> model = attempt_compile(model, device=device, imgsz=640, use_autocast=True, warmup=True)
 
     Notes:
-        - If the current PyTorch build does not provide torch.compile, the function returns the input model immediately.
+        - If the current PyTorch build does not provide torch.compile or `mode` is False, the function returns the input
+          model immediately.
         - Compilation is lazy and runs at the first forward pass, so the inductor CPU prerequisite of a host C++
           compiler is verified up front and the original model is returned if none is available.
         - Warmup runs under torch.inference_mode and may use torch.autocast for CUDA/MPS to align compute precision.

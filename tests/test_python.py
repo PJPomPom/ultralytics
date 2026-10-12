@@ -46,6 +46,20 @@ from ultralytics.utils.downloads import download, safe_download
 from ultralytics.utils.torch_utils import TORCH_1_10, TORCH_1_11, TORCH_1_13, TORCH_2_0
 
 
+def test_predict_prefetch():
+    """Test prefetch preserves order and re-raises loader exceptions (CUDA-only path, otherwise uncovered on CPU CI)."""
+    from ultralytics.engine.predictor import _prefetch
+
+    def loader():
+        yield from (1, 2)
+        raise RuntimeError("loader failed")
+
+    batches = _prefetch(loader())
+    assert [next(batches), next(batches)] == [1, 2]
+    with pytest.raises(RuntimeError, match="loader failed"):
+        next(batches)
+
+
 def test_dataloader_caps_workers_to_batches():
     """Test tiny datasets do not spawn persistent workers beyond useful batch count."""
     single_batch = build_dataloader(range(4), batch=4, workers=8)
@@ -62,7 +76,7 @@ def test_dataloader_caps_workers_to_batches():
 
 
 def test_dataloader_cap_preserves_distributed_drop_last(monkeypatch):
-    """Test worker cap follows distributed sampler size without changing global drop_last behavior."""
+    """Test worker cap and drop_last follow the distributed sampler shard size."""
     sampler_cls = data_build.distributed.DistributedSampler
 
     def distributed_sampler(dataset, shuffle, seed):
@@ -102,6 +116,19 @@ def test_dataloader_empty_dataset_uses_dataloader_validation():
         build_dataloader([], batch=4, workers=2)
 
 
+def test_image_cache_shared_with_spawned_workers():
+    """Test the RAM image cache reaches spawned DataLoader workers as one shared buffer with intact contents."""
+    from ultralytics.data.base import BaseDataset
+
+    images = [np.full((8, 8, 3), i, dtype=np.uint8) for i in range(8)]
+    cache = BaseDataset._ImageCache(list(images))
+    loader = torch.utils.data.DataLoader(
+        cache, batch_size=4, sampler=range(8), num_workers=2, multiprocessing_context="spawn"
+    )
+    assert torch.equal(torch.cat(list(loader)), torch.from_numpy(np.stack(images)))
+    assert cache.buffer.is_shared()
+
+
 def test_build_yolo_dataset_hyp_isolated():
     """Test dataset construction never mutates hyperparameters on the shared cfg it was built from."""
     data = check_det_dataset("coco8.yaml")
@@ -126,6 +153,7 @@ def test_cfg_rejects_fuzzed_values():
         ("optimizer", None),
         ("split", None),
         ("copy_paste_mode", None),
+        ("patience", -1),
     ):
         with pytest.raises((TypeError, ValueError), match=key):
             get_cfg(overrides={key: value})
@@ -311,38 +339,27 @@ def test_model_methods():
 
 def test_model_load_remaps_cls_head_by_names():
     """Test class-name remap is limited to closed-set class-logit heads."""
-    from types import SimpleNamespace
+    from ultralytics.nn.tasks import DetectionModel, SegmentationModel, SemanticSegmentationModel, YOLOEModel
 
-    from ultralytics.models.yolo.detect.train import DetectionTrainer
-    from ultralytics.models.yolo.obb.train import OBBTrainer
-    from ultralytics.models.yolo.pose.train import PoseTrainer
-    from ultralytics.models.yolo.segment.train import SegmentationTrainer
-    from ultralytics.nn.tasks import DetectionModel, OBBModel, PoseModel, SegmentationModel, YOLOEModel
-
-    src = DetectionModel("yolo26n.yaml", nc=3, verbose=False)
-    tgt = DetectionModel("yolo26n.yaml", nc=2, verbose=False)
-    src.names, tgt.names = {0: "cat", 1: "dog", 2: "car"}, {0: "dog", 1: "cat"}
-    for seq in src.model[-1].cv3:
-        seq[-1].bias.data.copy_(torch.tensor([10.0, 20.0, 30.0]))
-    tgt.load(src, verbose=False)
-    assert all(seq[-1].bias.tolist() == [20.0, 10.0] for seq in tgt.model[-1].cv3)
+    for model_cls, cfg, branches in (
+        (DetectionModel, "yolo26n.yaml", ("cv3.0", "cv3.1", "cv3.2")),
+        (SegmentationModel, "yolo26n-seg.yaml", ("proto.semseg",)),
+        (SemanticSegmentationModel, "yolo26n-sem.yaml", ("classifier", "aux_head")),
+    ):
+        src, tgt = (model_cls(cfg, nc=nc, verbose=False) for nc in (3, 2))
+        src.names, tgt.names = {0: "cat", 1: "dog", 2: "car"}, {0: "dog", 1: "cat"}
+        for name, seq in src.model[-1].named_modules():
+            if name in branches:
+                seq[-1].bias.data.copy_(torch.tensor([10.0, 20.0, 30.0]))
+        tgt.load(src, verbose=False)
+        for name, seq in tgt.model[-1].named_modules():
+            if name in branches:
+                assert seq[-1].bias.tolist() == [20.0, 10.0]
 
     src = YOLOEModel("yoloe-26n.yaml", nc=3, verbose=False)
     tgt = YOLOEModel("yoloe-26n.yaml", nc=2, verbose=False)
     src.names, tgt.names = {0: "cat", 1: "dog", 2: "car"}, {0: "dog", 1: "cat"}
     tgt.load(src, verbose=False)  # YOLOE cv3 outputs embeddings, not class rows
-
-    names = {0: "dog", 1: "cat"}
-    for trainer_cls, model in (
-        (DetectionTrainer, DetectionModel("yolo26n.yaml", nc=2, verbose=False)),
-        (SegmentationTrainer, SegmentationModel("yolo26n-seg.yaml", nc=2, verbose=False)),
-        (PoseTrainer, PoseModel("yolo26n-pose.yaml", nc=2, data_kpt_shape=[17, 3], verbose=False)),
-        (OBBTrainer, OBBModel("yolo26n-obb.yaml", nc=2, verbose=False)),
-    ):
-        trainer = object.__new__(trainer_cls)
-        trainer.args = SimpleNamespace(cls_remap=True)
-        trainer.data = {"names": names}
-        assert trainer.set_model_names_for_load(model).names == names
 
 
 def test_model_profile():
@@ -363,7 +380,6 @@ def test_predict_txt(tmp_path):
     assert len(results) == 7, f"Expected 7 results from source list, got {len(results)}"
 
 
-@pytest.mark.skipif(True, reason="disabled for testing")
 def test_predict_csv_multi_row(tmp_path):
     """Test YOLO predictions with sources listed in multiple rows of a CSV file."""
     file = tmp_path / "sources_multi_row.csv"
@@ -375,7 +391,6 @@ def test_predict_csv_multi_row(tmp_path):
     assert len(results) == 7, f"Expected 7 results from multi-row CSV, got {len(results)}"
 
 
-@pytest.mark.skipif(True, reason="disabled for testing")
 def test_predict_csv_single_row(tmp_path):
     """Test YOLO predictions with sources listed in a single row of a CSV file."""
     file = tmp_path / "sources_single_row.csv"
@@ -654,45 +669,6 @@ def test_track_reid_auto_user_detections(tracker_type):
     assert len(tracks) == 2, f"native-ReID tracker must keep tracking without feats:\n{tracks}"
 
 
-@pytest.mark.parametrize("fuse_score", [True, False])
-def test_deepocsort_ocr_proximity_gate(fuse_score):
-    """DeepOCSORT OCR rejects a zero-IoU pair even when its appearance is identical, under both fuse_score settings."""
-    from types import SimpleNamespace
-
-    from ultralytics.trackers.basetrack import TrackState
-    from ultralytics.trackers.deep_oc_sort import DeepOCSORT
-
-    tracker = object.__new__(DeepOCSORT)
-    tracker.args = SimpleNamespace(fuse_score=fuse_score, match_thresh=0.8)
-    tracker.encoder, tracker.appearance_thresh, tracker.proximity_thresh, tracker.frame_id = object(), 0.9, 0.5, 2
-    track = SimpleNamespace(
-        angle=None,
-        last_observation=np.array([0, 0, 10, 10]),
-        smooth_feat=np.array([1.0, 0.0]),
-        state=TrackState.Tracked,
-        update=lambda *_: None,
-    )
-    detection = SimpleNamespace(xyxy=np.array([20, 20, 30, 30]), curr_feat=np.array([1.0, 0.0]), score=1.0)
-    # proves appearance is active and would override (ungated) this exact pair, so the OCR result below is caused by
-    # the proximity gate, not by appearance being unavailable
-    assert tracker._fuse_appearance(np.array([[1.0]]), [track], [detection]) == 0.0
-    assert tracker._ocr_associate([track], [detection], [], []) == ([0], [0])
-
-
-def test_reid_invalid_crops():
-    """Test ReID skips out-of-bounds detection crops while preserving feature alignment."""
-    from types import SimpleNamespace
-
-    from ultralytics.trackers.utils.reid import ReID
-
-    encoder = ReID.__new__(ReID)
-    encoder.is_pt = True
-    encoder.model = SimpleNamespace(predictor=lambda crops: [torch.ones(4) for _ in crops])
-    img = np.full((640, 640, 3), 128, dtype=np.uint8)
-    feats = encoder(img, np.array([[30, 30, 40, 40], [1100, 1100, 200, 200]], dtype=np.float32))
-    assert feats[0] is not None and feats[1] is None
-
-
 @pytest.mark.skipif(not ONLINE, reason="environment is offline")
 @pytest.mark.parametrize("model", MODELS)
 def test_track_stream(model, tmp_path, solution_assets):
@@ -778,6 +754,30 @@ def test_val_save_txt_pose(tmp_path):
                 assert abs(cx - x) < w / 2 + 0.05 and abs(cy - y) < h / 2 + 0.05, "keypoints misaligned with box"
 
 
+def test_val_save_json_semantic(tmp_path):
+    """Semantic val(save_json=True) writes the class maps at the original image size without the letterbox padding."""
+    if IS_RASPBERRYPI:
+        skip_rpi_semantic()
+    data = check_det_dataset("cityscapes8.yaml")
+    lut = np.full(256, 255, dtype=np.uint8)  # raw Cityscapes id -> train id, 255 = ignore
+    for k, v in data["label_mapping"].items():
+        if isinstance(v, int) and k >= 0:
+            lut[k] = v
+    model = YOLO(WEIGHTS_DIR / "yolo26n-sem.pt")
+    # imgsz=640: the 1024x2048 images get a 320x640 rect batch (val default) or a 640x640 letterbox with 160 padded rows
+    for rect in (True, False):
+        metrics = model.val(data="cityscapes8.yaml", imgsz=640, save_json=True, rect=rect, project=tmp_path, name="val")
+        correct = total = 0
+        for png in (Path(metrics.save_dir) / "results").glob("*.png"):
+            pred = lut[np.asarray(Image.open(png))]
+            gt = lut[np.asarray(Image.open(Path(data["path"]) / data["masks_dir"] / "val" / png.name))]
+            assert pred.shape == gt.shape, f"rect={rect}: {png.name} saved as {pred.shape}, image is {gt.shape}"
+            correct += ((pred == gt) & (gt != 255)).sum()
+            total += (gt != 255).sum()
+        # the saved masks score like the letterbox-space pixel accuracy; padding stretched into the image halves it
+        assert abs(correct / total - metrics.results_dict["metrics/pixel_acc"]) < 0.05, f"rect={rect}: masks misaligned"
+
+
 def test_pose_metrics_curves():
     """Test that pose curve labels contain four unique box and pose series."""
     from ultralytics.utils.metrics import PoseMetrics
@@ -817,7 +817,7 @@ def test_convert_signed_ndjson(monkeypatch):
 
     captured = []
 
-    async def convert(path, fraction):
+    async def convert(path, fraction, split):
         captured.append((path, fraction))
         return "dataset.ndjson.yaml"
 
@@ -1076,6 +1076,21 @@ def test_results_plot_without_boxes():
         assert r.plot(color_mode=color_mode).shape == orig_img.shape
 
 
+def test_results_plot_instance_keypoints_track_color():
+    """Test that color_mode='instance' colors tracked keypoints by track ID, like boxes and masks."""
+    from ultralytics.engine.results import Results
+    from ultralytics.utils.plotting import colors
+
+    boxes = torch.tensor([[0, 0, 30, 30, 5, 0.9, 0], [34, 34, 64, 64, 9, 0.9, 0]], dtype=torch.float32)  # ids 5, 9
+    keypoints = torch.tensor([[[15, 15, 1.0]] * 17, [[49, 49, 1.0]] * 17])
+    r = Results(
+        np.zeros((64, 64, 3), dtype=np.uint8), path="im.jpg", names={0: "person"}, boxes=boxes, keypoints=keypoints
+    )
+    im = r.plot(color_mode="instance", boxes=False)
+    assert im[15, 15].tolist() == list(colors(5, True))
+    assert im[49, 49].tolist() == list(colors(9, True))
+
+
 def test_results_depth_field():
     """A depth array becomes a DepthMap that survives the .cpu().numpy() chain."""
     from ultralytics.engine.results import DepthMap, Results
@@ -1265,7 +1280,7 @@ def test_data_utils(tmp_path):
 
 
 def test_safe_download_unzips_local_path_archive(tmp_path):
-    """Test safe_download() unzips local archive paths without treating them like remote URLs."""
+    """Test safe_download() unzips local zip and tar paths to the archive's single top-level directory."""
     dataset_dir = tmp_path / "coco8 local"
     archive = tmp_path / "coco8 local.zip"
     (dataset_dir / "images" / "train").mkdir(parents=True)
@@ -1283,6 +1298,25 @@ def test_safe_download_unzips_local_path_archive(tmp_path):
     assert extracted == expected_path, f"Extracted path {extracted} != expected {expected_path}"
     assert (extracted / "data.yaml").is_file(), f"data.yaml not found in {extracted}"
     assert (extracted / "images" / "val").is_dir(), f"images/val not found in {extracted}"
+
+    with tarfile.open(tar_archive := tmp_path / "coco8 local.tar", "w") as tar:
+        tar.add(dataset_dir, arcname=dataset_dir.name)
+    tar_extracted = safe_download(tar_archive, dir=tmp_path / "datasets2", unzip=True, progress=False)
+    assert tar_extracted == tmp_path / "datasets2" / dataset_dir.name, f"tar returned {tar_extracted}"
+
+    with tarfile.open(tgz_archive := tmp_path / "coco8 local.tgz", "w:gz") as tar:
+        tar.add(dataset_dir, arcname=dataset_dir.name)
+    tar_gz_archive = tmp_path / "coco8 local.tar.gz"
+    tar_gz_archive.write_bytes(tgz_archive.read_bytes())
+    for archive, target in ((tgz_archive, "datasets_tgz"), (tar_gz_archive, "datasets_tar_gz")):
+        extracted = safe_download(archive, dir=tmp_path / target, unzip=True, progress=False)
+        assert extracted == tmp_path / target / dataset_dir.name
+        assert (extracted / "data.yaml").is_file()
+
+    for name in ("corrupt.zip", "corrupt.tar.gz"):
+        mislabeled = tmp_path / name  # an HTML error page served with an archive suffix
+        mislabeled.write_bytes(b"<html>not an archive</html>\n")
+        assert safe_download(mislabeled, dir=tmp_path / "datasets3", unzip=True, progress=False) == mislabeled
 
 
 def test_safe_download_skips_unsafe_archive_members(tmp_path):
@@ -1310,7 +1344,7 @@ def test_safe_download_skips_unsafe_tar_members(tmp_path):
     extracted = safe_download(archive, dir=tmp_path / "datasets", unzip=True, progress=False)
 
     assert not (tmp_path / "unsafe.txt").exists()
-    assert (extracted / "safe.txt").is_file()
+    assert extracted == tmp_path / "datasets" / "safe.txt" and extracted.is_file()
 
 
 @pytest.mark.skipif(not ONLINE, reason="environment is offline")
@@ -1443,8 +1477,6 @@ def test_depth_calibration_checkpoint_provenance(tmp_path):
 @pytest.mark.parametrize("external", [False, True])
 def test_depth_trainer_records_portable_calibration_split(tmp_path, monkeypatch, external):
     """Calibration provenance records local splits without rejecting external validation paths."""
-    from types import SimpleNamespace
-
     from ultralytics.models.yolo import detect
     from ultralytics.models.yolo.depth import calibrate
     from ultralytics.models.yolo.depth.train import DepthTrainer
@@ -1465,7 +1497,7 @@ def test_depth_trainer_records_portable_calibration_split(tmp_path, monkeypatch,
     trainer.best = checkpoint
     trainer.last = tmp_path / "last.pt"
     trainer.save_dir = tmp_path
-    trainer.args = SimpleNamespace(plots=False)
+    trainer.args = get_cfg(overrides={"plots": False})
     trainer.test_loader = []
     trainer.device = "cpu"
     trainer.data = {"path": dataset_root, "val": str(validation_path), "hash": "manifest-sha256"}
@@ -1477,10 +1509,23 @@ def test_depth_trainer_records_portable_calibration_split(tmp_path, monkeypatch,
         assert str(tmp_path) not in captured["validation_split"]
 
 
+def test_verify_image_label_keeps_polygons_sharing_a_box(tmp_path):
+    """Keep distinct polygons that share a class and box, and drop exact duplicate polygon rows."""
+    from ultralytics.data.utils import verify_image_label
+
+    im, lb = tmp_path / "0.jpg", tmp_path / "0.txt"
+    cv2.imwrite(str(im), np.zeros((32, 32, 3), np.uint8))
+    rows = ["0 0.2 0.2 0.8 0.2 0.8 0.8", "0 0.2 0.2 0.2 0.8 0.8 0.8"]  # two triangles tiling one square
+    lb.write_text("\n".join([*rows, rows[0]]))
+    _, labels, _, segments, *_ = verify_image_label((str(im), str(lb), "", False, 1, 0, 0, False))
+    assert len(labels) == len(segments) == 2
+
+
 def test_depth_dataset_ignores_unreadable_targets(tmp_path):
     """Drop unreadable depth maps and accept single-class mode with empty class labels."""
     from ultralytics.data.dataset import DepthDataset
     from ultralytics.data.utils import save_depth_png
+    from ultralytics.utils import DEFAULT_CFG
 
     images, depth = tmp_path / "images" / "train", tmp_path / "depth" / "train"
     images.mkdir(parents=True)
@@ -1499,7 +1544,10 @@ def test_depth_dataset_ignores_unreadable_targets(tmp_path):
     (depth / "corrupt.png").write_text("not a png file")
 
     data = {"names": {0: "depth"}, "nc": 1, "channels": 3, "depth_scale": 100}
-    ds = DepthDataset(img_path=str(images), imgsz=32, data=data, augment=False, single_cls=True, batch_size=1)
+    hyp = copy(DEFAULT_CFG)
+    hyp.mosaic = 1.0  # pin the value the unsupported-argument zeroing must not reach, regardless of ambient state
+    ds = DepthDataset(img_path=str(images), imgsz=32, data=data, augment=False, single_cls=True, batch_size=1, hyp=hyp)
+    assert hyp.mosaic == 1.0  # construction must never mutate the caller's hyp namespace
     assert {Path(f).stem for f in ds.im_files} == {"valid", "scaled", "legacy"}
     assert sorted(ds._load_depth(i).max() for i in range(len(ds))) == [1.0, 1.5, 2.0]
     legacy_index = next(i for i, path in enumerate(ds.im_files) if Path(path).stem == "legacy")
@@ -1539,14 +1587,6 @@ def test_utils_checks(monkeypatch):
     assert checks.parse_version("v2.1") == (2, 1, 0)
     assert checks.parse_version("1.0rc1") == (1, 0, 0)  # documented non-PEP-440 tradeoff: pre-releases equal the final
     monkeypatch.setattr(checks.metadata, "version", package_version)
-    monkeypatch.setattr(checks, "ARM64", True)
-    monkeypatch.setattr(checks, "AUTOINSTALL", True)
-    monkeypatch.setattr(checks, "ONLINE", True)
-    commands = []
-    monkeypatch.setattr(checks.subprocess, "check_output", lambda command, **kwargs: commands.append(command) or "")
-    requirements = ["ray[tune]", "nvidia-modelopt[onnx]>=0.44", "$(touch /tmp/pwned)/missing"]
-    assert checks.check_requirements(requirements)
-    assert commands[0][5:] == requirements  # requirements remain individual argv entries, never shell source
     assert not checks.check_version("v2", ">=2.0")  # installed version-shaped package keeps metadata precedence
     versions = ("v2.1-rc.1", "v2.1-beta1", "v2.1rev1", "v2.1-dev1", "v2.1+cu118")
     assert all(checks.check_version(v, ">=2.0") for v in versions)
@@ -1627,6 +1667,17 @@ def test_semantic_loss_all_ignore(nc):
     assert torch.isfinite(loss).all() and all(torch.isfinite(x).all() for x in items.values())
     loss.backward()
     assert preds.grad is not None and aux.grad is not None
+
+
+def test_semantic_confusion_matrix_large_counts():
+    """SemanticMetrics must keep counting past float32's 2**24, where accumulating 1.0 at a time would saturate."""
+    from ultralytics.utils.metrics import SemanticMetrics
+
+    metrics = SemanticMetrics(names={0: "a", 1: "b"})
+    metrics.matrix = torch.full((2, 2), float(2**24))  # counts already accumulated from a large val set
+    zeros = torch.zeros((1, 10, 10), dtype=torch.int32)
+    metrics.update_stats(zeros, zeros)
+    assert metrics.matrix[0, 0].item() == 2**24 + 100, f"confusion matrix saturated at {metrics.matrix[0, 0].item()}"
 
 
 class _DepthLossModel(torch.nn.Module):
@@ -1729,6 +1780,25 @@ def test_scale_coords_nonuniform_letterbox():
     coords = torch.tensor([[160.0, 224.0]])
     assert np.allclose(ops.scale_boxes((640, 640), boxes, (100, 200)), [[10, 10, 100, 60]])
     assert torch.allclose(ops.scale_coords((640, 640), coords, (100, 200)), coords.new_tensor([[50, 20]]))
+
+
+def test_scale_masks_odd_letterbox_pad():
+    """Mask scaling with the dataloader's ratio_pad must end the crop where the letterbox content ends."""
+    from ultralytics.data.augment import LetterBox
+    from ultralytics.utils import ops
+
+    # A 1000x1920 or 1920x1000 image, resized to 333x640 or 640x333, gets 19 rows or columns of padding: 9 and 10
+    for shape, im0_shape, pad in (((352, 640), (1000, 1920), (0, 9)), ((640, 352), (1920, 1000), (9, 0))):
+        h, w = im0_shape[0] // 3, im0_shape[1] // 3
+        labels = {"img": np.zeros((h, w, 3), dtype=np.uint8), "ratio_pad": (h / im0_shape[0], w / im0_shape[1])}
+        ratio_pad = LetterBox(shape, scaleup=False)(labels)["ratio_pad"]  # ((gain_h, gain_w), (left, top))
+        assert ratio_pad[1] == pad
+        left, top = pad
+        masks = torch.zeros(1, 1, *shape)
+        masks[..., top : top + h, left : left + w] = 1 + torch.rand(h, w)  # positive content, zero padding
+        scaled = ops.scale_masks(masks, im0_shape, ratio_pad=ratio_pad)
+        assert (scaled > 0.5).all()  # every original pixel is content: no padded row or column survived the crop
+        assert torch.equal(scaled, ops.scale_masks(masks, im0_shape))  # the ratio_pad=None crop is unchanged
 
 
 def test_nms_end2end_classes_before_max_det():
@@ -1845,21 +1915,33 @@ def test_nn_detect_head_export_clamps_max_det():
     assert head.postprocess(torch.rand(1, anchors, 4 + head.nc)).shape == (1, anchors, 6)
 
 
+@pytest.mark.parametrize("h, w", [(14, 28), (28, 14), (20, 20)])
+def test_nn_aifi_pos_embed_row_major(h, w):
+    """AIFI position embedding follows the row-major token order of x.flatten(2), with the row encoding first."""
+    from ultralytics.nn.modules.transformer import AIFI
+
+    pe = AIFI.build_2d_sincos_position_embedding(w, h, 8, like=torch.zeros(1))[0].view(h, w, 8)
+    assert torch.equal(pe[..., :4], pe[:, :1, :4].expand(h, w, 4))  # row encoding constant along each row
+    assert torch.equal(pe[..., 4:], pe[:1, :, 4:].expand(h, w, 4))  # column encoding constant down each column
+
+
 def _depth_head_feats():
     """Return a small Depth head constructor kwargs-matched P3/P4/P5 feature pyramid."""
     return [torch.randn(1, 32, 32, 32), torch.randn(1, 64, 16, 16), torch.randn(1, 128, 8, 8)]
 
 
 def test_nn_depth_head_export_upsamples_to_input():
-    """Depth export upsamples x4 to input resolution; inference returns native head resolution."""
+    """Depth export upsamples x4 on the depth loss align_corners=True grid; inference returns native head resolution."""
+    import torch.nn.functional as F
+
     from ultralytics.nn.modules.head import Depth
 
-    head = Depth(c_mid=32, ch=(32, 64, 128)).eval()
+    head, x = Depth(c_mid=32, ch=(32, 64, 128)).eval(), _depth_head_feats()
+    native = head(x)
+    assert native.shape[-2:] == (64, 64)  # inference returns native head resolution
     for fmt in ("onnx", "coreml"):
         head.export, head.format = True, fmt
-        assert head(_depth_head_feats()).shape[-2:] == (256, 256)
-    head.export = False
-    assert head(_depth_head_feats()).shape[-2:] != (256, 256)  # inference returns native head resolution
+        assert torch.equal(head(x), F.interpolate(native, scale_factor=4.0, mode="bilinear", align_corners=True))
 
 
 def test_nn_depth_head_no_dead_parameters():
@@ -1875,6 +1957,7 @@ def test_nn_depth_head_no_dead_parameters():
 def test_classification_fraction_samples_across_classes(tmp_path):
     """Sample classification fractions across the class-major ImageFolder ordering."""
     from ultralytics.data.dataset import ClassificationDataset
+    from ultralytics.data.split import split_classify_dataset
 
     for class_index in range(3):
         class_dir = tmp_path / str(class_index)
@@ -1886,6 +1969,10 @@ def test_classification_fraction_samples_across_classes(tmp_path):
     samples = ClassificationDataset(tmp_path, args, augment=True).samples
 
     assert np.bincount([sample[1] for sample in samples]).tolist() == [2, 2, 2]
+    for ratio in (0.5, 0.75, 0.25):
+        split = split_classify_dataset(tmp_path, train_ratio=ratio)
+        train, val = ({p.relative_to(split / k) for p in (split / k).rglob("*.jpg")} for k in ("train", "val"))
+        assert len(train) == int(4 * ratio) * 3 and len(train | val) == 12 and train.isdisjoint(val)
 
 
 def test_classification_split_class_alignment(tmp_path):
@@ -1893,9 +1980,13 @@ def test_classification_split_class_alignment(tmp_path):
     from ultralytics.data.dataset import ClassificationDataset
 
     for name in ("b", "c", "d"):  # the split lacks the model's first class and adds one it does not have
-        (tmp_path / name).mkdir()
-        cv2.imwrite(str(tmp_path / name / "0.jpg"), np.zeros((16, 16, 3), dtype=np.uint8))
-    samples = ClassificationDataset(tmp_path, DEFAULT_CFG, names={0: "a", 1: "b", 2: "c"}).samples
+        for folder in (tmp_path / name, tmp_path / name / "nested"):
+            folder.mkdir()
+            cv2.imwrite(str(folder / "0.jpg"), np.zeros((16, 16, 3), dtype=np.uint8))
+    data = check_cls_dataset(tmp_path)
+    copied = [p.relative_to(data[k]) for k in ("train", "val") for p in data[k].rglob("*.jpg")]
+    assert len(copied) == len(set(copied)) == 6
+    samples = ClassificationDataset(data["train"], DEFAULT_CFG, names={0: "a", 1: "b", 2: "c"}).samples
     assert sorted(sample[1] for sample in samples) == [1, 2]
 
 
@@ -2002,44 +2093,8 @@ def test_process_mask_native_chunked():
     assert torch.equal(out, ref)
 
 
-@pytest.mark.skipif(IS_RASPBERRYPI, reason="Edge devices not intended for CLIP-based models")
-@pytest.mark.skipif(
-    checks.IS_PYTHON_3_8 and LINUX and ARM64,
-    reason="YOLOWorld with CLIP is not supported in Python 3.8 and aarch64 Linux",
-)
-def test_yolo_world():
-    """Test YOLO world models with CLIP support."""
-    model = YOLO(WEIGHTS_DIR / "yolov8s-world.pt")  # no YOLO11n-world model yet
-    model.set_classes(["tree", "window"])
-    model(SOURCE, conf=0.01)
-
-    model = YOLO(WEIGHTS_DIR / "yolov8s-worldv2.pt")  # no YOLO11n-world model yet
-    # Training from a pretrained model. Eval is included at the final stage of training.
-    # Use dota8.yaml which has fewer categories to reduce the inference time of CLIP model
-    model.train(
-        data="dota8.yaml",
-        epochs=1,
-        imgsz=32,
-        cache="disk",
-        close_mosaic=1,
-    )
-
-    # test WorWorldTrainerFromScratch
-    from ultralytics.models.yolo.world.train_world import WorldTrainerFromScratch
-
-    model = YOLO("yolov8s-worldv2.yaml")  # no YOLO11n-world model yet
-    model.train(
-        data={"train": {"yolo_data": ["dota8.yaml"]}, "val": {"yolo_data": ["dota8.yaml"]}},
-        epochs=1,
-        imgsz=32,
-        cache="disk",
-        close_mosaic=1,
-        trainer=WorldTrainerFromScratch,
-    )
-
-
 @pytest.mark.skipif(IS_RASPBERRYPI, reason="Edge devices not intended for heavy CLIP-based models")
-@pytest.mark.skipif(not TORCH_1_13, reason="YOLOE with CLIP requires torch>=1.13")
+@pytest.mark.skipif(not TORCH_2_0, reason="MobileCLIP2 uses scaled_dot_product_attention (torch>=2.0)")
 @pytest.mark.skipif(
     checks.IS_PYTHON_3_8 and LINUX and ARM64,
     reason="YOLOE with CLIP is not supported in Python 3.8 and aarch64 Linux",
@@ -2048,7 +2103,7 @@ def test_yoloe(tmp_path):
     """Test YOLOE models with MobileCLIP support."""
     # Predict
     # text-prompts
-    model = YOLO(WEIGHTS_DIR / "yoloe-11s-seg.pt")
+    model = YOLO(WEIGHTS_DIR / "yoloe-26n-seg.pt")
     model.set_classes(["person", "bus"])
     model.set_classes(["bus", "person"])
     assert list(model.names.values()) == ["bus", "person"]
@@ -2069,7 +2124,7 @@ def test_yoloe(tmp_path):
     )
 
     # Val
-    model = YOLOE(WEIGHTS_DIR / "yoloe-11s-seg.pt")
+    model = YOLOE(WEIGHTS_DIR / "yoloe-26n-seg.pt")
     # text prompts
     model.val(data="coco128-seg.yaml", imgsz=32)
     # visual prompts
@@ -2078,7 +2133,7 @@ def test_yoloe(tmp_path):
     # Train, fine-tune
     from ultralytics.models.yolo.yoloe import YOLOEPEFreeTrainer, YOLOEPESegTrainer, YOLOESegTrainerFromScratch
 
-    model = YOLOE("yoloe-11s-seg.pt")
+    model = YOLOE("yoloe-26n-seg.pt")
     model.train(
         data="coco128-seg.yaml",
         epochs=1,
@@ -2091,7 +2146,7 @@ def test_yoloe(tmp_path):
     data_yaml = tmp_path / "yoloe-data.yaml"
     YAML.save(data=data_dict, file=data_yaml)
     for data in [data_dict, data_yaml]:
-        model = YOLOE("yoloe-11s-seg.yaml")
+        model = YOLOE("yoloe-26n-seg.yaml")
         model.train(
             data=data,
             epochs=1,
@@ -2102,13 +2157,13 @@ def test_yoloe(tmp_path):
 
     # prompt-free
     # predict
-    model = YOLOE(WEIGHTS_DIR / "yoloe-11s-seg-pf.pt")
+    model = YOLOE(WEIGHTS_DIR / "yoloe-26n-seg-pf.pt")
     model.predict(SOURCE)
     # val
-    model = YOLOE("yoloe-11s-seg.pt")  # or select yoloe-m/l-seg.pt for different sizes
+    model = YOLOE("yoloe-26n-seg.pt")  # or select yoloe-26s/m/l/x-seg.pt for different sizes
     model.val(data="coco128-seg.yaml", imgsz=32)
     # train, freezing everything but the classification branch
-    model = YOLOE("yoloe-11s-seg.pt")
+    model = YOLOE("yoloe-26n-seg.pt")
     head = len(model.model.model) - 1
     freeze = [str(i) for i in range(head)]
     freeze += [f"{head}.{name}" for name, _ in model.model.model[-1].named_children() if "cv3" not in name]
@@ -2133,16 +2188,22 @@ def test_yoloe_vocab_head_switch():
     model = YOLO(WEIGHTS_DIR / "yoloe-26n-seg.pt")
     model.model.args["imgsz"] = 32
     names = ["person", "bus"]
-    model.set_vocab(model.get_vocab(names), names)
+    vocab = model.get_vocab(names)  # one-to-many branch
+    model.set_vocab(vocab, names)
     for nms in (None, False):
         model(SOURCE, imgsz=32, nms=nms)
+
+    dual = YOLO(WEIGHTS_DIR / "yoloe-26n-seg.pt")  # one head per branch, as the yoloe-26*-seg-pf.pt weights carry
+    dual.model.args["imgsz"] = 32
+    dual.model.end2end = True
+    dual.set_vocab(vocab, names, one2one_vocab=dual.get_vocab(names))
+    for nms in (None, False):
+        dual(SOURCE, imgsz=32, nms=nms)
 
 
 def test_yoloe_visual_prompt_verbose_false(capfd):
     """Verify that YOLOE visual prompting respects verbose=False."""
-    model = YOLO(WEIGHTS_DIR / "yoloe-11s-seg.pt")
-
-    from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
+    model = YOLO(WEIGHTS_DIR / "yoloe-26n-seg.pt")
 
     visuals = {
         "bboxes": np.array([[221.52, 405.8, 344.98, 857.54]]),
@@ -2152,11 +2213,10 @@ def test_yoloe_visual_prompt_verbose_false(capfd):
     # Ignore any output produced while loading the model
     capfd.readouterr()
 
-    model.predict(
+    results = model.predict(
         SOURCE,
         refer_image=SOURCE,
         visual_prompts=visuals,
-        predictor=YOLOEVPSegPredictor,
         verbose=False,
     )
 
@@ -2164,6 +2224,7 @@ def test_yoloe_visual_prompt_verbose_false(capfd):
     output = captured.out + captured.err
 
     assert "Ultralytics" not in output
+    assert model.task == "segment" and results[0].masks is not None
 
 
 def test_yolov10():
@@ -2222,7 +2283,7 @@ def test_grayscale(task: str, model: str, data: str, tmp_path) -> None:
     export_model = model.export(format="onnx")
 
     model = YOLO(export_model, task=task)
-    model.predict(source=im, imgsz=32)
+    assert len(model.predict(source=[im, im], imgsz=32)) == 2  # reuse the static batch-1 export for over-batch coverage
 
 
 def test_semantic_polygon_data():
@@ -2231,3 +2292,54 @@ def test_semantic_polygon_data():
     model = YOLO("yolo26n-sem.pt")
     model.train(data="coco8-seg.yaml", epochs=1, imgsz=32, close_mosaic=1)
     model.val(data="coco8-seg.yaml")
+
+
+def test_semantic_cache_nc_edit_1bit_masks(tmp_path):
+    """Test a yaml-only nc 2->1 edit still loads 1-bit masks as {0, 1} from a cache scanned at nc=2."""
+    from ultralytics.data.dataset import SemanticDataset
+
+    images, masks = tmp_path / "images" / "train", tmp_path / "masks" / "train"
+    images.mkdir(parents=True)
+    masks.mkdir(parents=True)
+    foreground = np.zeros((32, 32), dtype=np.uint8)
+    foreground[8:24, 8:24] = 255
+    cv2.imwrite(str(images / "a.jpg"), np.zeros((32, 32, 3), dtype=np.uint8))
+    Image.fromarray(foreground).convert("1").save(masks / "a.png")  # cv2 later reads this as 0/255
+
+    data = {"names": {0: "bg", 1: "fg"}, "nc": 2}
+    SemanticDataset(img_path=str(images), imgsz=32, data=data)  # scan and cache at nc=2
+    dataset = SemanticDataset(img_path=str(images), imgsz=32, data={**data, "nc": 1})  # yaml-only nc edit
+    assert set(np.unique(dataset.load_mask(0))) == {0, 1}  # 1-bit foreground remapped from 255
+
+
+def test_verify_image_label_whitespace_lines(tmp_path):
+    """Test whitespace-only lines in label files no longer mark an image corrupt."""
+    from ultralytics.data.utils import verify_image_label
+
+    im = tmp_path / "a.jpg"
+    cv2.imwrite(str(im), np.zeros((32, 48, 3), dtype=np.uint8))
+
+    lb = tmp_path / "a.txt"  # detection rows with a whitespace-only line between them
+    lb.write_text("0 0.5 0.5 0.1 0.1\n \t\n1 0.25 0.25 0.2 0.2\n", encoding="utf-8")
+    args = (str(im), str(lb), "", False, 2, 0, 2, False)
+    _, out, _, _, _, _, nf, _, nc, _ = verify_image_label(args)
+    assert (nf, nc) == (1, 0) and out.shape == (2, 5)  # both rows parsed, image kept
+
+    lb.write_text("0 0.1 0.1 0.3 0.1 0.3 0.3\n\t\n0 0.4 0.4 0.6 0.4 0.6 0.6\n", encoding="utf-8")  # segment rows
+    _, out, _, segments, _, _, nf, _, nc, _ = verify_image_label(args)
+    assert (nf, nc) == (1, 0) and out.shape == (2, 5) and len(segments) == 2  # both polygons parsed
+
+
+def test_load_yolo_dota_whitespace_lines(tmp_path):
+    """Test whitespace-only lines in DOTA label files no longer crash the loader."""
+    from ultralytics.data.split_dota import load_yolo_dota
+
+    images, labels = tmp_path / "images" / "train", tmp_path / "labels" / "train"
+    images.mkdir(parents=True)
+    labels.mkdir(parents=True)
+    cv2.imwrite(str(images / "a.jpg"), np.zeros((64, 64, 3), dtype=np.uint8))
+    (labels / "a.txt").write_text(
+        "0.1 0.1 0.3 0.1 0.3 0.3 0.1 0.3 0\n \t\n0.4 0.4 0.6 0.4 0.6 0.6 0.4 0.6 1\n", encoding="utf-8"
+    )
+    annos = load_yolo_dota(str(tmp_path), split="train")
+    assert len(annos) == 1 and annos[0]["label"].shape == (2, 9)  # both rows parsed

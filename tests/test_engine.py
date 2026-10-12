@@ -177,6 +177,15 @@ def test_resume_incomplete(task, weight, data, tmp_path):
     assert resume_model.trainer.start_epoch == resume_model.trainer.epoch == 1, "resume test failed"
 
 
+def test_resume_invalid_checkpoint_args(tmp_path):
+    """Test resuming a checkpoint with invalid train args raises the real error, not a missing-checkpoint error."""
+    _, ckpt = load_checkpoint(MODEL)
+    ckpt["train_args"]["epochs"] = 0  # ultralytics <= 8.4.154 stored epochs < 1 without validating it
+    torch.save(ckpt, last := tmp_path / "last.pt")
+    with pytest.raises(ValueError, match="epochs"):
+        detect.DetectionTrainer(overrides={"model": MODEL, "data": "coco8.yaml", "resume": str(last)})
+
+
 def test_distill_resume(tmp_path: Path):
     """Test knowledge distillation resumes from an incomplete checkpoint."""
     overrides = {
@@ -255,7 +264,7 @@ def test_nan_recovery():
     def inject_nan(trainer):
         """Inject NaN into loss during batch processing to test recovery mechanism."""
         if trainer.epoch == 1 and trainer.tloss is not None and not nan_injected[0]:
-            trainer.tloss[next(iter(trainer.tloss))] *= float("nan")
+            trainer.loss = torch.tensor(float("nan"))  # the loss _handle_nan_recovery checks at epoch end
             nan_injected[0] = True
 
     overrides = {"data": "coco8.yaml", "model": "yolo26n.yaml", "imgsz": 32, "epochs": 3}

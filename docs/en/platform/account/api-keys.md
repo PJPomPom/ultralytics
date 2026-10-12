@@ -27,7 +27,7 @@ Create a new API key:
 3. Enter a name for the key (e.g., "Training Server")
 4. Click **Create Key**
 
-![Ultralytics Platform Settings API Keys Tab Create API Key Dialog](https://cdn.ul.run/i/f06be245e628d7129554260107ae1bf7.avif)<!-- screenshot -->
+![Ultralytics Platform Settings API Keys Tab Create API Key Dialog](https://cdn.ul.run/i/44264db05b4663de74af579ccaaa610d.avif)<!-- screenshot -->
 
 ### Key Name
 
@@ -41,18 +41,18 @@ Give your key a descriptive name:
 
 After creation, the key is displayed in a confirmation dialog:
 
-![Ultralytics Platform Settings API Keys Tab API Key Created Copy Dialog](https://cdn.ul.run/i/9d54f61a64e1d9887f622d64834d7d2e.avif)<!-- screenshot -->
+![Ultralytics Platform Settings API Keys Tab API Key Created Copy Dialog](https://cdn.ul.run/i/0061648d44959da04b8f607c42b723eb.avif)<!-- screenshot -->
 
 !!! tip "Copy Your Key"
 
     Copy your key after creation for easy reference. You can also use the copy button in the key list anytime; the list displays only each key's prefix.
 
-## Provider Keys for Agents
+## Provider Keys for Agents and Annotation
 
-The same **Settings > API Keys** tab also stores keys for external model providers used by [Agents](../agents.md). Only the workspace owner can add, replace, or remove these keys; team members can see which providers are connected. Ask the owner to connect a missing provider. To connect a provider as the owner:
+The same **Settings > API Keys** tab also stores keys for external model providers used by [Agents](../agents.md) and by the paid models in [class-prompted annotation](../data/annotation.md#class-prompted-smart-annotation); annotation reads the key saved in the dataset's workspace. Only the workspace owner can add, replace, or remove these keys; team members can see which providers are connected. Ask the owner to connect a missing provider. To connect a provider as the owner:
 
 1. Click **Add Key**.
-2. Select the provider matching your workflow's language or vision-language model.
+2. Select the provider matching your workflow's language or vision-language model, or the annotation model you want to run.
 3. Paste that provider's API key into **API Key**, then click **Save Key**. The dialog's **Get an API key** link opens the provider's key page.
 
 An Ultralytics key does not authenticate external model providers. Provider usage is billed through the provider account associated with the saved key. Use the key row's edit control to replace a provider key.
@@ -146,15 +146,16 @@ See [Cloud Training](../train/cloud-training.md#remote-training) for the complet
 
 All keys are listed on the `Settings > API Keys` tab:
 
-Each key card shows the key name, the copyable key value, the relative creation time, and a revoke button.
+Each key row shows the key name, the key prefix, the creation date, a copy button for the full key, and a remove (trash)
+button.
 
 ### Revoke Key
 
 Revoke a key that's compromised or no longer needed:
 
 1. Find the key in the API Keys section
-2. Click the **Revoke** (trash) button
-3. Confirm revocation
+2. Click the remove (trash) button
+3. Click **Remove Key** to confirm
 
 !!! warning "Immediate Effect"
 
@@ -269,7 +270,7 @@ Keys don't expire automatically. They remain valid until revoked. Consider imple
 
 ### Can I see my key after creation?
 
-Yes, full key values are visible in the key list on `Settings > API Keys`. The Platform decrypts and displays your keys so you can copy them anytime.
+Yes. The key list on `Settings > API Keys` shows each key's prefix, and its copy button copies the full key value anytime.
 
 ### Are keys region-specific?
 

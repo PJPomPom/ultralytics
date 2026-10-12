@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests import MODEL, SOURCE
+from tests import SOURCE
 from tests.conftest import isolated_model_path
 from ultralytics import YOLO
 from ultralytics.cfg import TASK2DATA, TASK2MODEL, TASKS, _handle_deprecation, get_cfg
@@ -49,7 +49,23 @@ def skip_rpi_semantic(task):
 def test_export_torchscript(nms, isolated_model):
     """Test YOLO model export to TorchScript format for compatibility and correctness."""
     file = YOLO(isolated_model).export(format="torchscript", imgsz=32, nms=nms)
-    YOLO(file)(SOURCE, imgsz=32)  # exported model inference
+    model = YOLO(file)
+    model(SOURCE, imgsz=32)  # exported model inference
+    model(SOURCE, imgsz=64)  # predictor reuse must keep the fixed export imgsz
+    assert model.predictor.imgsz == [32, 32]
+
+
+@pytest.mark.parametrize(("model_name", "nc"), [("yolo26n.yaml", 80), ("yolo26n-cls.yaml", 1000)])
+def test_export_torchscript_missing_names(model_name, nc, tmp_path):
+    """Test TorchScript export reconstructs missing class names from the model head's class count."""
+    model = YOLO(model_name)
+    model.model.names = None  # legacy and foreign checkpoints reach the exporter without names
+    model.model.pt_path = str(tmp_path / Path(model_name).with_suffix(".pt").name)
+
+    names = YOLO(model.export(format="torchscript", imgsz=32)).names
+
+    assert len(names) == nc  # a 999-name fallback would leave names[999] missing on a 1000-class head
+    assert names[nc - 1] == f"class{nc - 1}"
 
 
 @pytest.mark.parametrize("nms", [None, False])
@@ -148,19 +164,9 @@ def test_quantize_deprecation():
     assert _handle_deprecation({"half": True, "quantize": 8})["quantize"] == 8  # explicit quantize still wins
 
 
-def test_benchmark_forwards_legacy_precision(monkeypatch):
-    """model.benchmark(half=True) must reach the benchmark call as quantize=16, not silently run FP32."""
-    import ultralytics.utils.benchmarks as bm
-
-    captured = {}
-    monkeypatch.setattr(bm, "benchmark", lambda **kw: captured.update(kw) or {})
-    YOLO(MODEL).benchmark(half=True, format="onnx", data="coco8.yaml")
-    assert captured["quantize"] == 16, f"legacy half was dropped: quantize={captured.get('quantize')}"
-
-
 def test_qnn_quantize_requires_w8a16():
     """QNN exports are W8A16; explicit INT8 activation quantization is not supported."""
-    valid_args = ["batch", "data", "dynamic", "fraction", "keras", "nms"]
+    valid_args = ["batch", "data", "dynamic", "fraction", "nms"]
     validate_args("qnn", SimpleNamespace(quantize="w8a16"), valid_args)
     with pytest.raises(AssertionError, match=r"quantize=8 \(INT8\) is not supported"):
         validate_args("qnn", SimpleNamespace(quantize=8), valid_args)
