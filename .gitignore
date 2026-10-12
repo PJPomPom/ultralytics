@@ -216,7 +216,7 @@ debug/labels/val/*
 
 debug/output/*
 debug/temp/*
-
+ultralytics/cfg/datasets/*
 
 
 
